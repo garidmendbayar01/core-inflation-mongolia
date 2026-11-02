@@ -1,0 +1,265 @@
+---
+author: "Garid Mendbayar"
+title: "02_fit_local_level"
+date: "2026-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(readxl)
+library(tidyverse)
+library(seasonal)
+
+# Make sure the figures folder exists before any ggsave() below
+dir.create(here("output", "state_space_figures"), showWarnings = FALSE)
+```
+
+## Load the cleaned inflation series
+
+```{r}
+pi_2023 <- readRDS(here("data", "state_space", "headline_pi_2023base.rds"))
+pi_ts   <- ts(pi_2023$pi, start = c(2010, 2), frequency = 12)
+```
+
+## Fit the local level model
+
+```{r}
+fit <- StructTS(pi_ts, type = "level")
+fit$coef
+```
+
+## Interpret the estimates: signal-to-noise and Kalman gain
+
+```{r}
+q <- unname(fit$coef["level"] / fit$coef["epsilon"])    # signal-to-noise ratio
+K <- (-q + sqrt(q^2 + 4 * q)) / 2                       # share of each surprise absorbed into trend
+c(q = q, K = K,
+  sd_step  = sqrt(unname(fit$coef["level"])),
+  sd_noise = sqrt(unname(fit$coef["epsilon"])))
+```
+
+## Plot headline inflation against the filtered and smoothed trend
+
+```{r}
+results <- pi_2023 |>
+  mutate(filtered = as.numeric(fitted(fit)),
+         smoothed = as.numeric(tsSmooth(fit)))
+
+p_trend_raw <- results |>
+  pivot_longer(c(pi, filtered, smoothed)) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line()
+p_trend_raw
+ggsave(here("output", "state_space_figures", "local_level_unadjusted.png"),
+       p_trend_raw, width = 9, height = 5, dpi = 300)
+```
+
+## Check for seasonality: average inflation by calendar month
+
+```{r}
+pi_2023 |>
+  mutate(month = month(date, label = TRUE)) |>
+  group_by(month) |>
+  summarise(avg_pi = mean(pi), sd_pi = sd(pi))
+```
+
+```{r}
+p_seasonal <- pi_2023 |>
+  mutate(month = month(date, label = TRUE)) |>
+  ggplot(aes(month, pi)) +
+  geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.4) +
+  geom_boxplot(fill = "grey92", colour = "grey20", width = 0.6,
+               outlier.size = 1.2, linewidth = 0.4) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2,
+               fill = "white", colour = "black") +
+  labs(x = NULL,
+       y = "Annualized monthly inflation (%)",
+       caption = "Source: National Statistics Office of Mongolia; author's calculations.") +
+  theme_classic(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, colour = "grey30", size = 9),
+        axis.text = element_text(colour = "black"))
+p_seasonal
+
+ggsave(here("output", "state_space_figures", "seasonality_by_month.png"),
+       p_seasonal, width = 6.5, height = 3.5, dpi = 300)
+ggsave(here("output", "state_space_figures", "seasonality_by_month.pdf"),
+       p_seasonal, width = 6.5, height = 3.5)
+```
+
+## Seasonally adjust the CPI index with X-13
+
+```{r}
+index_ts <- ts(pi_2023$index, start = c(2010, 2), frequency = 12)
+sa       <- seas(index_ts)
+index_sa <- final(sa)
+```
+
+## Seasonally adjusted monthly inflation
+
+```{r}
+pi_sa_ts <- 1200 * diff(log(index_sa))
+```
+
+## Refit the local level model on adjusted inflation
+
+```{r}
+fit_sa <- StructTS(pi_sa_ts, type = "level")
+
+q_sa <- unname(fit_sa$coef["level"] / fit_sa$coef["epsilon"])
+K_sa <- (-q_sa + sqrt(q_sa^2 + 4 * q_sa)) / 2
+c(q = q_sa, K = K_sa,
+  sd_step  = sqrt(unname(fit_sa$coef["level"])),
+  sd_noise = sqrt(unname(fit_sa$coef["epsilon"])))
+```
+
+## Filtered and smoothed trend, seasonally adjusted
+
+```{r}
+results_sa <- tibble(
+  date     = seq(ym("2010-03"), ym("2026-08"), by = "month"),
+  pi_sa    = as.numeric(pi_sa_ts),
+  filtered = as.numeric(fitted(fit_sa)),
+  smoothed = as.numeric(tsSmooth(fit_sa)))
+
+
+p_trend_sa <- results_sa |>
+  pivot_longer(c(pi_sa, filtered, smoothed)) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line()
+p_trend_sa
+ggsave(here("output", "state_space_figures", "local_level_sa.png"),
+       p_trend_sa, width = 9, height = 5, dpi = 300)
+
+saveRDS(results_sa, here("data", "state_space", "local_level_sa_results.rds"))
+```
+
+## Convert the trend to a year-over-year basis
+
+```{r}
+results_sa <- results_sa |>
+  mutate(trend_yoy = 100 * (exp(zoo::rollmeanr(filtered, 12, fill = NA) / 100) - 1))
+
+headline_yoy <- pi_2023 |>
+  mutate(headline_yoy = 100 * (index / lag(index, 12) - 1)) |>
+  select(date, headline_yoy)
+```
+
+## Load and clean Mongolbank's published inflation series
+
+```{r}
+boa_raw <- read_excel(here("data", "trimmed_mean", "inflation-rate.xlsx"),
+                      sheet = 1, skip = 2, col_names = FALSE)
+names(boa_raw) <- c("date_raw", "national_mom", "national_yoy",
+                    "ub_mom", "ub_yoy", "core_mom", "core_yoy")
+
+boa <- boa_raw |>
+  mutate(is_corrupted = str_detect(date_raw, "^\\d+$"),
+         month = if_else(is_corrupted,
+                         paste0(format(as.Date(as.numeric(date_raw), origin = "1899-12-30"), "%Y"), "-01"),
+                         str_sub(date_raw, 1, -2)),
+         date = ym(month)) |>
+  select(date, national_mom:core_yoy) |>
+  arrange(date)
+
+saveRDS(boa, here("data", "state_space", "mongolbank_inflation.rds"))
+```
+
+## Validation: NSO-derived headline vs Mongolbank's published headline
+
+```{r}
+headline_yoy |>
+  inner_join(boa, by = "date") |>
+  summarise(max_gap = max(abs(headline_yoy - national_yoy), na.rm = TRUE),
+            cor     = cor(headline_yoy, national_yoy, use = "complete.obs"))
+```
+
+## Where does the headline gap come from?
+
+```{r}
+headline_yoy |>
+  inner_join(boa, by = "date") |>
+  mutate(gap = headline_yoy - national_yoy) |>
+  group_by(year = year(date)) |>
+  summarise(mean_abs_gap = mean(abs(gap), na.rm = TRUE),
+            max_abs_gap  = max(abs(gap), na.rm = TRUE))
+```
+
+## Compare the state-space trend with headline and Mongolbank's core
+
+```{r}
+comparison <- results_sa |>
+  select(date, trend_yoy) |>
+  left_join(headline_yoy, by = "date") |>
+  left_join(select(boa, date, core_yoy), by = "date") |>
+  filter(date >= ym("2017-01"))
+
+p_compare <- comparison |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL)
+p_compare
+ggsave(here("output", "state_space_figures", "trend_vs_headline_core.png"),
+       p_compare, width = 9, height = 5, dpi = 300)
+
+saveRDS(comparison, here("data", "state_space", "comparison_yoy.rds"))
+```
+
+## Figure 3: trend before and after seasonal adjustment
+
+```{r}
+fig3_data <- bind_rows(
+  results    |> transmute(date, panel = "A. Unadjusted inflation",
+                          inflation = pi, filtered, smoothed),
+  results_sa |> transmute(date, panel = "B. Seasonally adjusted inflation",
+                          inflation = pi_sa, filtered, smoothed)
+) |>
+  pivot_longer(c(inflation, filtered, smoothed)) |>
+  mutate(name = factor(name,
+           levels = c("inflation", "filtered", "smoothed"),
+           labels = c("Monthly inflation (annualized)",
+                      "Filtered trend (real time)",
+                      "Smoothed trend (full sample)")))
+
+p_fig3 <- ggplot(fig3_data, aes(date, value, colour = name, linetype = name)) +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_line(linewidth = 0.5) +
+  scale_colour_manual(values = c("grey70", "#1f4e79", "#c0504d")) +
+  scale_linetype_manual(values = c("solid", "solid", "dashed")) +
+  facet_wrap(~ panel, ncol = 1) +
+  labs(x = NULL, y = "Annualized monthly inflation (%)", colour = NULL, linetype = NULL,
+       caption = "Source: National Statistics Office of Mongolia; author's calculations.") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0),
+        plot.caption = element_text(hjust = 0, colour = "grey30", size = 9),
+        axis.text = element_text(colour = "black"))
+p_fig3
+
+ggsave(here("output", "state_space_figures", "fig3_trend_unadjusted_vs_sa.png"),
+       p_fig3, width = 6.5, height = 6.5, dpi = 300)
+ggsave(here("output", "state_space_figures", "fig3_trend_unadjusted_vs_sa.pdf"),
+       p_fig3, width = 6.5, height = 6.5)
+```
+
+## Table 2: estimates before and after seasonal adjustment
+
+```{r}
+tab2 <- tibble(
+  Parameter = c("Trend step, $\\sigma_\\varepsilon$", "Noise, $\\sigma_\\eta$",
+                "Signal-to-noise ratio, $q$", "Kalman gain, $K$"),
+  Unadjusted = c(sqrt(fit$coef["level"]), sqrt(fit$coef["epsilon"]), q, K),
+  `Seasonally adjusted` = c(sqrt(fit_sa$coef["level"]), sqrt(fit_sa$coef["epsilon"]), q_sa, K_sa)
+)
+
+knitr::kable(tab2, format = "latex", booktabs = TRUE, digits = 2, escape = FALSE,
+             caption = "Local level model estimates, before and after seasonal adjustment")
+```
