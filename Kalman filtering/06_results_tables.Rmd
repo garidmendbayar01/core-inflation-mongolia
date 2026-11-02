@@ -1,0 +1,101 @@
+---
+title: "06_results_tables"
+author: "Garid Mendbayar"
+date: "2026-09-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(Matrix)
+
+source(here("Kalman filtering", "ssm_functions.R"))
+dir.create(here("output", "state_space_tables"), showWarnings = FALSE)
+```
+
+## The three samples
+
+```{r}
+results_sa <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+pi_2015    <- readRDS(here("data", "state_space", "headline_pi_2015base.rds"))
+
+y_main <- results_sa$pi_sa
+y_2011 <- results_sa |> filter(date >= ymd("2011-01-01")) |> pull(pi_sa)
+y_2015 <- as.numeric(1200 * diff(log(seasonal::final(seasonal::seas(
+            ts(pi_2015$index, start = c(2006, 2), frequency = 12))))))
+
+samples <- list(
+  `2010-2026 (main, 2023 base)` = list(y = y_main, start = c(2010, 3)),
+  `2011-2026 (drop 2010)`       = list(y = y_2011, start = c(2011, 1)),
+  `2006-2022 (2015 base)`       = list(y = y_2015, start = c(2006, 3))
+)
+```
+
+## Table 1: constant-parameter models
+
+```{r, cache=TRUE}
+fmt <- function(x) sprintf("%.2f [%.2f, %.2f]",
+                           quantile(x, 0.50), quantile(x, 0.05), quantile(x, 0.95))
+
+summarise_sample <- function(y, start) {
+  fit <- StructTS(ts(y, start = start, frequency = 12), type = "level")
+  qq  <- unname(fit$coef["level"] / fit$coef["epsilon"])
+  ft  <- run_fat_tails(y, sig2_eta_start = unname(fit$coef["epsilon"]),
+                          sig2_eps_start = unname(fit$coef["level"]))
+  tibble(
+    months          = length(y),
+    stage1_step_sd  = round(sqrt(unname(fit$coef["level"])), 2),
+    stage1_noise_sd = round(sqrt(unname(fit$coef["epsilon"])), 2),
+    stage1_K        = round((-qq + sqrt(qq^2 + 4 * qq)) / 2, 2),
+    ft_step_sd      = fmt(sqrt(ft$par[, "sig2_eps"])),
+    ft_noise_sd     = fmt(sqrt(ft$par[, "sig2_eta"])),
+    ft_nu           = fmt(ft$par[, "nu"])
+  )
+}
+
+table_constant <- imap_dfr(samples, ~ summarise_sample(.x$y, .x$start) |>
+                                      mutate(sample = .y, .before = 1))
+print(table_constant, width = Inf)
+write_csv(table_constant, here("output", "state_space_tables", "constant_parameter_models.csv"))
+```
+
+## Table 2: UC-SV volatilities
+
+```{r}
+ucsv_sets <- list(
+  `2010-2026 (main, 2023 base)` =
+    readRDS(here("data", "state_space", "ucsv_results.rds")) |>
+    select(date, noise = noise_vol, trend = trend_vol),
+  `2010-2026, gamma = 0.2` =
+    readRDS(here("data", "state_space", "ucsv_results_gamma02.rds")) |>
+    select(date, noise = noise_vol, trend = trend_vol),
+  `2011-2026 (drop 2010)` =
+    readRDS(here("data", "state_space", "robust_2011_ucsv.rds")) |>
+    select(date, noise = noise_2011, trend = trend_vol_2011),
+  `2006-2022 (2015 base)` =
+    readRDS(here("data", "state_space", "robust_2015base_ucsv.rds")) |>
+    select(date, noise = noise_vol, trend = trend_vol)
+)
+
+table_ucsv <- imap_dfr(ucsv_sets, ~ .x |>
+  summarise(noise_median = median(noise),
+            noise_min    = min(noise),
+            noise_max    = max(noise),
+            trend_median = median(trend, na.rm = TRUE),
+            trend_min    = min(trend, na.rm = TRUE),
+            trend_max    = max(trend, na.rm = TRUE)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)),
+         sample = .y, .before = 1))
+
+print(table_ucsv, width = Inf)
+write_csv(table_ucsv, here("output", "state_space_tables", "ucsv_volatilities.csv"))
+```
+
+
