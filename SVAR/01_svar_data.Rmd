@@ -1,0 +1,210 @@
+---
+title: "SVAR data: quarterly GDP and CPI, 2000Q1 onward"
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+library(here)
+library(readxl)
+library(seasonal)
+
+dir.create(here("data", "svar"), showWarnings = FALSE)
+dir.create(here("output", "svar_figures"), showWarnings = FALSE)
+
+gdp_const_file <- "nso_gdp_constant_bases_cum_2026-10-07.xlsx"   # 2005, 2010, 2015 prices (year-to-date totals)
+gdp_chain_file <- "nso_gdp_chain_cum_2026-10-07.xlsx"            # chain-linked, reference year 2024 (year-to-date totals)
+gdp_version    <- "chain"                                        # "chain" (main) or "2015" (robustness)
+cpi_file   <- "nso_cpi_divisions_all_bases_2026-10-06.xlsx"   # update when new NSO data arrive
+svar_start <- ymd("2006-01-01")                                # CPI now starts January 2006
+```
+
+## Steps 1-3: Read, de-cumulate, and link real GDP across bases
+
+```{r}
+# NSO reports year-to-date totals; convert them to individual quarters
+read_nso_cum <- function(file) {
+  raw <- read_excel(here("data", "raw", file), col_names = FALSE)
+  hdr <- unlist(raw[2, -(1:2)])
+  raw |>
+    slice(3:n()) |>
+    set_names(c("series", "sector", hdr)) |>
+    filter(str_trim(sector) == "ДНБ") |>
+    pivot_longer(-c(series, sector), names_to = "quarter", values_to = "cum") |>
+    mutate(cum  = as.numeric(cum),
+           year = as.integer(str_sub(quarter, 1, 4)),
+           q    = as.integer(str_sub(quarter, 6, 6)),
+           date = make_date(year, 3 * q - 2, 1)) |>
+    filter(!is.na(cum)) |>
+    group_by(series, year) |>
+    arrange(q, .by_group = TRUE) |>
+    filter(first(q) == 1) |>                                  # need Q1 to de-cumulate a year
+    mutate(gdp = cum - lag(cum, default = 0)) |>
+    ungroup() |>
+    select(series, date, gdp)
+}
+
+labels <- c("ДНБ, 2005 оны зэрэгцүүлэх үнээр"              = "b2005",
+            "ДНБ, 2010 оны зэрэгцүүлэх үнээр"              = "b2010",
+            "ДНБ, 2015 оны зэрэгцүүлэх үнээр"              = "b2015",
+            "ДНБ, хэлхээ индексийн аргаар (жиших он=2024)" = "chain")
+
+gdp_wide <- bind_rows(read_nso_cum(gdp_const_file), read_nso_cum(gdp_chain_file)) |>
+  filter(series %in% names(labels)) |>
+  mutate(base = labels[series]) |>
+  select(date, base, gdp) |>
+  pivot_wider(names_from = base, values_from = gdp) |>
+  arrange(date)
+
+gdp_wide |> summarise(across(-date, \(x) paste(format(min(date[!is.na(x)])), "to", format(max(date[!is.na(x)])))))
+
+# check against the previous file: 2024 at 2015 prices should be about 6.08, 8.36, 8.44, 9.24 million
+gdp_wide |> filter(year(date) == 2024) |> select(date, b2015)
+
+# how much do the bases disagree on year-over-year growth?
+gdp_wide |>
+  mutate(across(-date, \(x) 100 * (log(x) - log(lag(x, 4))))) |>
+  summarise(gap_05_10    = mean(abs(b2005 - b2010), na.rm = TRUE),
+            gap_10_15    = mean(abs(b2010 - b2015), na.rm = TRUE),
+            gap_15_chain = mean(abs(b2015 - chain), na.rm = TRUE))
+
+# ratio-link over full overlap years
+link <- function(new, old, yr) {
+  d <- gdp_wide[year(gdp_wide$date) == yr, ]
+  sum(d[[new]]) / sum(d[[old]])
+}
+l_05_10 <- link("b2010", "b2005", 2010)
+l_10_15 <- link("b2015", "b2010", 2015)
+l_15_ch <- link("chain", "b2015", 2019)
+
+gdp_versions <- gdp_wide |>
+  transmute(date,
+            gdp_2015  = coalesce(b2015, b2010 * l_10_15, b2005 * l_05_10 * l_10_15),
+            gdp_chain = coalesce(chain, gdp_2015 * l_15_ch))
+saveRDS(gdp_versions, here("data", "svar", "gdp_linked_versions.rds"))
+
+gdp_linked <- gdp_versions |>
+  transmute(date, gdp = if (gdp_version == "chain") gdp_chain else gdp_2015)
+range(gdp_linked$date); nrow(gdp_linked)
+saveRDS(gdp_linked, here("data", "svar", "gdp_linked_nsa.rds"))
+
+p_gdp <- gdp_versions |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, log(value), colour = name)) +
+  geom_line() +
+  geom_vline(xintercept = ymd(c("2010-01-01", "2015-01-01", "2019-01-01")), linetype = "dashed", colour = "grey50") +
+  labs(x = NULL, y = "Log real GDP (not seasonally adjusted)", colour = NULL)
+p_gdp
+ggsave(here("output", "svar_figures", "gdp_linked_nsa.png"), p_gdp, width = 9, height = 5, dpi = 300)
+```
+
+## Step 4: Seasonally adjust GDP with X-13
+
+```{r}
+gdp_ts <- ts(gdp_linked$gdp, start = c(2000, 1), frequency = 4)
+sa_gdp <- seas(gdp_ts)
+summary(sa_gdp)
+qs(sa_gdp)                     # check for any seasonality left over
+
+gdp_sa <- gdp_linked |>
+  mutate(gdp_sa = as.numeric(final(sa_gdp)),
+         growth = 400 * (log(gdp_sa) - log(lag(gdp_sa))))   # annualized quarterly growth, %
+saveRDS(gdp_sa, here("data", "svar", "gdp_sa.rds"))
+
+p_gdp_sa <- gdp_sa |>
+  select(date, `Not adjusted` = gdp, `Seasonally adjusted` = gdp_sa) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, log(value), colour = name)) +
+  geom_line() +
+  labs(x = NULL, y = "Log real GDP (chain-linked, linked to earlier bases)", colour = NULL)
+p_gdp_sa
+ggsave(here("output", "svar_figures", "gdp_sa.png"), p_gdp_sa, width = 9, height = 5, dpi = 300)
+
+p_growth <- ggplot(gdp_sa, aes(date, growth)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Real GDP growth (annualized, %)")
+p_growth
+ggsave(here("output", "svar_figures", "gdp_growth_sa.png"), p_growth, width = 9, height = 5, dpi = 300)
+```
+
+## Step 4b: Link monthly CPI across bases (2015 base before 2010, 2023 base from 2010)
+
+```{r}
+cpi_raw <- read_excel(here("data", "raw", cpi_file), col_names = FALSE)
+
+cpi_long <- cpi_raw |>
+  slice(3:n()) |>
+  set_names(c("base", "division", unlist(cpi_raw[2, -(1:2)]))) |>
+  pivot_longer(-c(base, division), names_to = "month", values_to = "index") |>
+  mutate(index = as.numeric(index),
+         date  = ym(month),
+         base  = str_extract(base, "\\d{4}")) |>
+  filter(!is.na(index))
+saveRDS(cpi_long, here("data", "svar", "cpi_divisions_all_bases.rds"))
+
+hl <- cpi_long |>
+  filter(division == "Ерөнхий индекс") |>
+  select(date, base, index) |>
+  pivot_wider(names_from = base, values_from = index, names_prefix = "b")
+
+link_15_23 <- with(filter(hl, year(date) == 2010), sum(b2023) / sum(b2015))
+
+cpi_linked <- hl |>
+  mutate(cpi = if_else(!is.na(b2023), b2023, b2015 * link_15_23)) |>
+  filter(!is.na(cpi)) |>
+  select(date, cpi)
+range(cpi_linked$date)
+saveRDS(cpi_linked, here("data", "svar", "cpi_linked_monthly.rds"))
+```
+
+## Step 5: Quarterly CPI inflation, seasonally adjusted
+
+```{r}
+cpi_q <- cpi_linked |>
+  mutate(qdate = floor_date(date, "quarter")) |>
+  group_by(qdate) |>
+  summarise(cpi = mean(cpi), n = n(), .groups = "drop") |>
+  filter(n == 3) |>                                  # keep complete quarters only
+  select(date = qdate, cpi)
+range(cpi_q$date)
+
+cpi_ts <- ts(cpi_q$cpi, start = c(year(min(cpi_q$date)), quarter(min(cpi_q$date))), frequency = 4)
+sa_cpi <- seas(cpi_ts, regression.aictest = NULL,    # no Easter/trading-day effects (not relevant for Mongolia)
+               transform.function = "log")           # seasonal swings proportional to the price level
+summary(sa_cpi)
+qs(sa_cpi)
+
+cpi_q <- cpi_q |>
+  mutate(cpi_sa   = as.numeric(final(sa_cpi)),
+         infl     = 400 * (log(cpi_sa) - log(lag(cpi_sa))),   # annualized, seasonally adjusted
+         infl_nsa = 400 * (log(cpi)    - log(lag(cpi))))
+saveRDS(cpi_q, here("data", "svar", "cpi_q_sa.rds"))
+
+p_infl <- cpi_q |>
+  select(date, `Not adjusted` = infl_nsa, `Seasonally adjusted` = infl) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "CPI inflation (annualized quarterly, %)", colour = NULL)
+p_infl
+ggsave(here("output", "svar_figures", "inflation_q_sa.png"), p_infl, width = 9, height = 5, dpi = 300)
+```
+
+## Step 6: Combine into the SVAR dataset
+
+```{r}
+svar_data <- gdp_sa |>
+  select(date, growth) |>
+  inner_join(select(cpi_q, date, infl), by = "date") |>
+  filter(date >= svar_start, !is.na(growth), !is.na(infl))
+range(svar_data$date); nrow(svar_data)
+saveRDS(svar_data, here("data", "svar", "svar_data.rds"))
+```

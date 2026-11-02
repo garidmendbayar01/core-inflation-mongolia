@@ -1,0 +1,102 @@
+---
+title: "SVAR robustness: 2015-price GDP instead of the chain-linked series"
+author: "Garid Mendbayar"
+date: "2026-10-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Re-estimates the Quah-Vahey SVAR with real GDP at constant 2015 prices and compares
+the resulting core with the baseline (chain-linked GDP). Reads the files saved by
+01_svar_data and 02_svar_model; overwrites nothing that other steps use.
+
+```{r packages}
+library(vars)        # load before tidyverse: vars brings in MASS, whose select() would mask dplyr's
+library(seasonal)
+library(tidyverse)
+library(here)
+select <- dplyr::select
+```
+
+## Step 1: SVAR data with 2015-price GDP
+
+```{r}
+gdp15 <- readRDS(here("data", "svar", "gdp_linked_versions.rds")) |>
+  transmute(date, gdp = gdp_2015) |>
+  filter(!is.na(gdp))
+
+sa15 <- seas(ts(gdp15$gdp, start = c(year(min(gdp15$date)), quarter(min(gdp15$date))), frequency = 4))
+gdp15 <- gdp15 |>
+  mutate(gdp_sa = as.numeric(final(sa15)),
+         growth = 400 * (log(gdp_sa) - log(lag(gdp_sa))))
+
+base_data <- readRDS(here("data", "svar", "svar_data.rds"))      # baseline: chain-linked growth + inflation
+svar15 <- base_data |>
+  select(date, infl) |>
+  inner_join(select(gdp15, date, growth), by = "date") |>
+  filter(!is.na(growth)) |>
+  relocate(date, growth, infl)
+range(svar15$date); nrow(svar15)
+
+# how different is growth under the two GDP series?
+base_data |> select(date, growth_chain = growth) |>
+  inner_join(select(svar15, date, growth_2015 = growth), by = "date") |>
+  mutate(after_2020 = date >= ymd("2020-01-01")) |>
+  group_by(after_2020) |>
+  summarise(cor = cor(growth_chain, growth_2015),
+            mean_abs_gap = mean(abs(growth_chain - growth_2015)), .groups = "drop") |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+## Step 2: VAR, long-run identification, and core (same steps as 02_svar_model)
+
+```{r}
+y <- svar15 |> select(growth, infl) |> as.matrix()
+VARselect(y, lag.max = 6, type = "const")$selection
+p   <- VARselect(y, lag.max = 6, type = "const")$selection[["SC(n)"]]
+fit <- VAR(y, p = p, type = "const")
+roots(fit)
+serial.test(fit, lags.pt = 12, type = "PT.asymptotic")
+
+bq <- BQ(fit)
+B  <- bq$B %*% diag(c(sign(bq$LRIM[1, 1]), sign(bq$B[2, 2])))
+stopifnot(p == 1)                                              # the core formula below assumes one lag
+A1  <- Acoef(fit)[[1]]
+mu  <- solve(diag(2) - A1, sapply(fit$varresult, \(m) coef(m)[["const"]]))
+eps <- resid(fit) %*% t(solve(B))
+
+contrib <- matrix(0, nrow(eps), 2)
+for (t in seq_len(nrow(eps))) {
+  contrib[t, ] <- A1 %*% (if (t == 1) c(0, 0) else contrib[t - 1, ]) + B[, 2] * eps[t, 2]
+}
+core15 <- tibble(date = svar15$date[-1], core_2015 = mu[2] + contrib[, 2])
+saveRDS(core15, here("data", "svar", "qv_core_gdp2015.rds"))
+```
+
+## Step 3: Compare with the baseline core
+
+```{r}
+to_yoy <- \(x) { p <- cumsum(x / 400); 100 * (exp(p - lag(p, 4)) - 1) }
+
+cmp <- readRDS(here("data", "svar", "qv_core.rds")) |>
+  select(date, core_chain = core) |>
+  inner_join(core15, by = "date") |>
+  mutate(yoy_chain = to_yoy(core_chain), yoy_2015 = to_yoy(core_2015))
+
+cmp |> summarise(cor_quarterly      = cor(core_chain, core_2015),
+                 mean_abs_gap_q     = mean(abs(core_chain - core_2015)),
+                 cor_yoy            = cor(yoy_chain, yoy_2015, use = "complete.obs"),
+                 mean_abs_gap_yoy   = mean(abs(yoy_chain - yoy_2015), na.rm = TRUE)) |>
+  round(2)
+
+cmp |>
+  select(date, `Chain-linked GDP (baseline)` = yoy_chain, `2015-price GDP` = yoy_2015) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "SVAR core inflation, year-over-year (%)", colour = NULL) +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+```

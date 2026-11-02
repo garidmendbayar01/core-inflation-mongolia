@@ -1,0 +1,241 @@
+---
+title: "SVAR model: Quah-Vahey core inflation"
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(vars)        # load first: it brings in MASS, whose select() would mask dplyr's
+library(urca)
+library(tidyverse)
+library(here)
+
+select <- dplyr::select   # MASS (loaded with vars) also has a select(); use dplyr's
+svar_data <- readRDS(here("data", "svar", "svar_data.rds"))
+```
+
+## Step 1: Stationarity tests
+
+```{r}
+unit_root <- function(x, name) {
+  adf  <- ur.df(x, type = "drift", lags = 4, selectlags = "AIC")
+  kpss <- ur.kpss(x, type = "mu", lags = "short")
+  tibble(series    = name,
+         adf_stat  = adf@teststat[1],  adf_5pct  = adf@cval[1, "5pct"],
+         kpss_stat = kpss@teststat,    kpss_5pct = kpss@cval[1, "5pct"])
+}
+
+bind_rows(unit_root(svar_data$growth,     "GDP growth"),
+          unit_root(svar_data$infl,       "Inflation"),
+          unit_root(diff(svar_data$infl), "Change in inflation"))
+```
+
+## Step 2: Lag length and reduced-form VAR
+
+```{r}
+y <- svar_data |> select(growth, infl) |> as.matrix()
+
+VARselect(y, lag.max = 6, type = "const")$selection
+
+p <- VARselect(y, lag.max = 6, type = "const")$selection[["SC(n)"]]
+var_fit <- VAR(y, p = p, type = "const")
+summary(var_fit)$roots                    # stability: all must be below 1
+serial.test(var_fit, lags.pt = 12, type = "PT.asymptotic")
+```
+
+## Step 3: Quah-Vahey identification (long-run restriction)
+
+```{r}
+bq <- BQ(var_fit)
+
+B  <- bq$B       # impact matrix: effect of each structural shock in the first quarter
+LR <- bq$LRIM    # long-run matrix: cumulative effect of each shock
+
+# sign convention: non-core shock raises long-run output; core shock raises inflation on impact
+s <- c(sign(LR[1, 1]), sign(B[2, 2]))
+B  <- B  %*% diag(s)
+LR <- LR %*% diag(s)
+dimnames(B) <- dimnames(LR) <- list(c("growth", "infl"), c("noncore", "core"))
+
+round(B, 3)
+round(LR, 3)
+```
+
+## Step 4: Core inflation from the historical decomposition
+
+```{r}
+A1  <- Acoef(var_fit)[[1]]                                    # VAR(1) coefficient matrix
+c0  <- sapply(var_fit$varresult, \(m) coef(m)[["const"]])
+mu  <- solve(diag(2) - A1, c0)                                # long-run means of growth and inflation
+eps <- resid(var_fit) %*% t(solve(B))                         # structural shocks
+colnames(eps) <- c("noncore", "core")
+
+n <- nrow(eps)
+contrib_core <- contrib_noncore <- matrix(0, n, 2)
+for (t in seq_len(n)) {
+  prev_c  <- if (t == 1) c(0, 0) else contrib_core[t - 1, ]
+  prev_nc <- if (t == 1) c(0, 0) else contrib_noncore[t - 1, ]
+  contrib_core[t, ]    <- A1 %*% prev_c  + B[, "core"]    * eps[t, "core"]
+  contrib_noncore[t, ] <- A1 %*% prev_nc + B[, "noncore"] * eps[t, "noncore"]
+}
+
+qv <- tibble(date         = svar_data$date[-1],
+             infl         = svar_data$infl[-1],
+             core         = mu[2] + contrib_core[, 2],
+             noncore_part = contrib_noncore[, 2])
+
+# check: inflation minus (mean + both parts) should start nonzero and die out
+qv |>
+  mutate(gap = infl - (core + noncore_part)) |>
+  summarise(first_gap = first(gap), fifth_gap = nth(gap, 5), last_gap = last(gap))
+
+saveRDS(qv, here("data", "svar", "qv_core.rds"))
+
+p_qv <- qv |>
+  select(date, `Headline inflation` = infl, `Core inflation (SVAR)` = core) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line() +
+  labs(x = NULL, y = "Inflation (annualized quarterly, %)", colour = NULL)
+p_qv
+ggsave(here("output", "svar_figures", "qv_core_inflation.png"), p_qv, width = 9, height = 5, dpi = 300)
+```
+
+## Step 5: Impulse responses and variance decomposition
+
+```{r}
+# variance decomposition: share of inflation and growth forecast errors due to each shock
+fevd_qv <- fevd(bq, n.ahead = 20)
+round(fevd_qv$infl[c(1, 4, 8, 12, 20), ], 3)
+round(fevd_qv$growth[c(1, 4, 8, 12, 20), ], 3)
+
+# impulse responses with 68% bootstrap bands (as in Doojav et al., 2026)
+set.seed(2026)
+irf_infl   <- irf(bq, response = "infl",   n.ahead = 20, boot = TRUE, runs = 1000, ci = 0.68)
+irf_output <- irf(bq, response = "growth", n.ahead = 20, boot = TRUE, runs = 1000, ci = 0.68,
+                  cumulative = TRUE)                         # cumulative growth = GDP level
+
+irf_df <- function(ir, resp, label) {
+  map_dfr(c("growth", "infl"), \(imp) tibble(
+    h = 0:20, impulse = imp, response = label,
+    est = ir$irf[[imp]][, resp], lo = ir$Lower[[imp]][, resp], hi = ir$Upper[[imp]][, resp]))
+}
+
+irf_all <- bind_rows(irf_df(irf_output, "growth", "Output (level)"),
+                     irf_df(irf_infl,   "infl",   "Inflation")) |>
+  mutate(impulse = recode(impulse, growth = "Non-core shock", infl = "Core shock"),
+         across(c(est, lo, hi), ~ if_else(response == "Output (level)", .x / 4, .x)),
+         response = recode(response, "Output (level)" = "Output (% of GDP level)",
+                                     "Inflation" = "Inflation (annualized pp)"))
+p_irf <- ggplot(irf_all, aes(h, est)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "grey85") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line() +
+  facet_grid(response ~ impulse, scales = "free_y") +
+    labs(x = "Quarters after shock", y = "Response") +
+  theme_classic(base_size = 11)
+p_irf
+ggsave(here("output", "svar_figures", "qv_irf.png"), p_irf, width = 8, height = 6, dpi = 300)
+```
+
+## Step 6: Robustness, change in inflation (Quah and Vahey's original setup)
+
+```{r}
+# historical contribution of one structural shock to one variable, for any lag length
+hd_contrib <- function(var_obj, B, shock, var) {
+  eps <- resid(var_obj) %*% t(solve(B))
+  n   <- nrow(eps)
+  Ph  <- Phi(var_obj, nstep = n)                       # MA coefficients; Ph[, , 1] is the identity
+  sapply(seq_len(n), \(t) sum(sapply(0:(t - 1), \(i)
+    (Ph[, , i + 1] %*% B[, shock])[var] * eps[t - i, shock])))
+}
+
+d_data <- svar_data |> mutate(dinfl = infl - lag(infl)) |> drop_na()
+y_d    <- d_data |> select(growth, dinfl) |> as.matrix()
+
+VARselect(y_d, lag.max = 6, type = "const")$selection
+p_d   <- VARselect(y_d, lag.max = 6, type = "const")$selection[["SC(n)"]]
+var_d <- VAR(y_d, p = p_d, type = "const")
+roots(var_d)
+serial.test(var_d, lags.pt = 12, type = "PT.asymptotic")
+
+bq_d <- BQ(var_d)
+B_d  <- bq_d$B %*% diag(c(1, sign(bq_d$B[2, 2])))     # core shock raises inflation on impact
+round(B_d, 3); round(bq_d$LRIM, 3)
+round(fevd(bq_d, n.ahead = 20)$dinfl[c(1, 4, 8, 12, 20), ], 3)
+
+# core inflation: cumulate the core shocks' contribution to the change in inflation
+A_sum  <- Reduce(`+`, Acoef(var_d))
+c_d    <- sapply(var_d$varresult, \(m) coef(m)[["const"]])
+mu_d   <- solve(diag(2) - A_sum, c_d)
+anchor <- svar_data$infl[svar_data$date == d_data$date[p_d]]   # inflation just before the sample
+
+core_d <- tibble(date       = d_data$date[-(1:p_d)],
+                 core_dinfl = mu_d[2] + hd_contrib(var_d, B_d, shock = 2, var = 2)) |>
+  mutate(core_alt = anchor + cumsum(core_dinfl))
+saveRDS(core_d, here("data", "svar", "qv_core_dinfl.rds"))
+
+# compare with the baseline
+qv_compare <- qv |> select(date, infl, core) |> inner_join(select(core_d, date, core_alt), by = "date")
+qv_compare |> summarise(cor_cores = cor(core, core_alt), mean_gap = mean(abs(core - core_alt)))
+
+p_rob <- qv_compare |>
+  select(date, Headline = infl, `Core (baseline)` = core, `Core (change in inflation)` = core_alt) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line() +
+  labs(x = NULL, y = "Inflation (annualized quarterly, %)", colour = NULL)
+p_rob
+ggsave(here("output", "svar_figures", "qv_core_robustness_dinfl.png"), p_rob, width = 9, height = 5, dpi = 300)
+```
+
+## Step 7: SVAR core year-over-year, compared with the other measures (quarterly)
+
+```{r}
+qv_yoy <- qv |>
+  mutate(p_core        = cumsum(core / 400),                         # log core price index (up to a constant)
+         svar_core_yoy = 100 * (exp(p_core - lag(p_core, 4)) - 1)) |>
+  select(date, svar_core_yoy)
+
+other_q <- readRDS(here("data", "exclusion", "fig4_comparison.rds")) |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(across(c(headline, official_core, ex_food, trend), mean), n = n(), .groups = "drop") |>
+  filter(n == 3) |>
+  select(-n)
+
+compare_q <- other_q |>
+  left_join(qv_yoy, by = "date") |>
+  filter(!is.na(svar_core_yoy))
+saveRDS(compare_q, here("data", "svar", "compare_quarterly_yoy.rds"))
+
+compare_q |>
+  summarise(across(c(headline, ex_food, trend, svar_core_yoy),
+                   list(mean   = mean,
+                        sd     = sd,
+                        smooth = \(x) mean(abs(diff(x))),
+                        cor_hl = \(x) cor(x, headline)))) |>
+  pivot_longer(everything(), names_to = c("measure", "stat"), names_pattern = "(.*)_(mean|sd|smooth|cor_hl)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(across(-measure, \(x) round(x, 2)))
+
+p_cmp <- compare_q |>
+  pivot_longer(-date) |>
+  mutate(name = factor(name,
+           levels = c("headline", "official_core", "ex_food", "trend", "svar_core_yoy"),
+           labels = c("Headline", "Official core", "Ex-food", "Local level trend", "SVAR core"))) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Year-over-year inflation (%, quarterly average)", colour = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+p_cmp
+ggsave(here("output", "svar_figures", "compare_all_measures_quarterly.png"), p_cmp, width = 9, height = 5, dpi = 300)
+```
