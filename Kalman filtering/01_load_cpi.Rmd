@@ -1,0 +1,95 @@
+---
+title: "01_load_cpi"
+author: "Garid Mendbayar"
+date: "2026-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(here)
+library(readxl)
+library(tidyverse)
+
+path <- here("data", "raw", "nso_cpi_groups_2026-09-28.xlsx")
+
+excel_sheets(path)          # how many sheets, and their names
+raw <- read_excel(path, sheet = 1)
+dim(raw)                    # rows x columns
+head(raw, 15)               # first 15 rows
+
+raw <- read_excel(path, sheet = 1, skip = 1)   # skip the title row
+
+# Step 1a: read it properly and reshape to long format.
+cpi_long <- raw |>
+  rename(base = 1, group = 2) |>
+  pivot_longer(-c(base, group), names_to = "month", values_to = "index") |>
+  mutate(index = as.numeric(index),
+         date  = ym(month)) |>
+  filter(!is.na(index))
+
+# Step 1b: see what each base year covers.
+cpi_long |>
+  group_by(base) |>
+  summarise(start = min(date), end = max(date), n_groups = n_distinct(group))
+
+# Step 1c: headline monthly inflation within each base
+headline <- cpi_long |>
+  filter(str_detect(group, "^Ерөнхий")) |>
+  mutate(base = str_sub(base, 1, 4)) |>          # "2015=100" -> "2015"
+  arrange(base, date) |>
+  group_by(base) |>
+  mutate(pi = 1200 * log(index / lag(index))) |>
+  ungroup() |>
+  filter(!is.na(pi))
+
+# Step 1d: compare the bases where they overlap
+headline |>
+  select(base, date, pi) |>
+  pivot_wider(names_from = base, values_from = pi) |>
+  filter(date >= ym("2010-02"), date <= ym("2022-07")) |>
+  summarise(max_diff_15_23 = max(abs(`2015` - `2023`)),
+            max_diff_20_23 = max(abs(`2020` - `2023`)),
+            cor_15_23      = cor(`2015`, `2023`))
+
+# Step 1e: find the gaps
+overlap <- headline |>
+  select(base, date, pi) |>
+  pivot_wider(names_from = base, values_from = pi) |>
+  filter(date >= ym("2010-02"), date <= ym("2022-07")) |>
+  mutate(diff = `2015` - `2023`)
+
+overlap |> arrange(desc(abs(diff))) |> select(date, `2015`, `2023`, diff) |> head(10)
+overlap |> summarise(cor = cor(`2015`, `2023`), mean_abs_diff = mean(abs(diff)))
+
+ggplot(overlap, aes(date, diff)) + geom_col()
+
+overlap |>
+  group_by(year = year(date)) |>
+  summarise(mean_abs_diff = mean(abs(diff)))
+
+# Step 1f: build the clean series and save it
+pi_2023 <- headline |>
+  filter(base == "2023") |>
+  select(date, index, pi)
+
+# sanity check: every month present, no gaps
+identical(pi_2023$date, seq(ym("2010-02"), ym("2026-08"), by = "month"))
+
+pi_ts <- ts(pi_2023$pi, start = c(2010, 2), frequency = 12)
+saveRDS(pi_2023, here("data", "state_space", "headline_pi_2023base.rds"))
+```
+
+## Also save the 2015-base headline series (for robustness check B)
+
+```{r}
+pi_2015 <- headline |>
+  filter(base == "2015") |>
+  select(date, index, pi)
+
+saveRDS(pi_2015, here("data", "state_space", "headline_pi_2015base.rds"))
+range(pi_2015$date)
+```

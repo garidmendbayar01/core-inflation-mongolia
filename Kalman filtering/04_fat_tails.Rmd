@@ -1,0 +1,248 @@
+---
+title: "04_fat_tails"
+author: "Garid Mendbayar"
+date: "2026-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(Matrix)
+
+source(here("Kalman filtering", "ssm_functions.R"))
+dir.create(here("output", "state_space_figures"), showWarnings = FALSE)
+```
+
+## Load the data and Stage 1 results
+
+```{r}
+results_sa  <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+y           <- results_sa$pi_sa
+fit_sa      <- StructTS(ts(y, start = c(2010, 3), frequency = 12), type = "level")
+resid_check <- y - results_sa$smoothed
+```
+
+## Fat-tailed noise: draw each month's multiplier
+
+```{r}
+sample_lambda <- function(resid, noise_var, nu) {
+  shape <- (nu + 1) / 2
+  rate  <- (nu + resid^2 / noise_var) / 2
+  1 / rgamma(length(resid), shape = shape, rate = rate)
+}
+```
+
+## Test: which months does the fat-tailed model flag as extreme?
+
+```{r}
+set.seed(2026)
+lambda_check <- replicate(2000, sample_lambda(resid_check,
+                                              noise_var = fit_sa$coef["epsilon"],
+                                              nu = 5))
+
+tibble(date = results_sa$date, lambda = apply(lambda_check, 1, median)) |>
+  arrange(desc(lambda)) |>
+  head(8)
+```
+
+## Fat-tailed noise: draw nu (how common extreme months are)
+
+```{r}
+sample_nu <- function(lambda, nu_grid = c(seq(2.1, 10, by = 0.1), 11:60)) {
+  logpost <- sapply(nu_grid, function(nu)
+    sum(dgamma(1 / lambda, shape = nu / 2, rate = nu / 2, log = TRUE) - 2 * log(lambda)))
+  sample(nu_grid, 1, prob = exp(logpost - max(logpost)))
+}
+```
+
+## Test: does sample_nu recover a known nu?
+
+```{r}
+set.seed(2026)
+lambda_sim <- 1 / rgamma(197, shape = 4 / 2, rate = 4 / 2)   # true nu = 4
+nu_check   <- replicate(2000, sample_nu(lambda_sim))
+quantile(nu_check, c(0.05, 0.50, 0.95))
+```
+
+## Fat-tailed model: Gibbs sampler
+
+```{r}
+run_fat_tails <- function(y, sig2_eta_start, sig2_eps_start,
+                          n_burn = 5000, n_keep = 10000, thin = 5, seed = 2026,
+                          a0 = 2, b0 = 1) {
+  n        <- length(y)
+  sig2_eta <- sig2_eta_start   # baseline noise variance
+  sig2_eps <- sig2_eps_start   # trend step variance
+  lambda   <- rep(1, n)        # monthly multipliers, start at "normal"
+  nu       <- 10               # start with moderate tails
+
+  tau_draws    <- matrix(NA, n_keep, n)
+  lambda_draws <- matrix(NA, n_keep, n)
+  par_draws    <- matrix(NA, n_keep, 3,
+                         dimnames = list(NULL, c("sig2_eta", "sig2_eps", "nu")))
+
+  set.seed(seed)
+  for (i in 1:(n_burn + n_keep * thin)) {
+    tau      <- sample_local_level(y, obs_var = sig2_eta * lambda, step_var = sig2_eps,
+                                   init_mean = y[1], init_var = 1e6)
+    e        <- y - tau
+    lambda   <- sample_lambda(e, sig2_eta, nu)
+    sig2_eta <- 1 / rgamma(1, a0 + n / 2,       b0 + sum(e^2 / lambda) / 2)
+    sig2_eps <- 1 / rgamma(1, a0 + (n - 1) / 2, b0 + sum(diff(tau)^2) / 2)
+    nu       <- sample_nu(lambda)
+
+    if (i > n_burn && (i - n_burn) %% thin == 0) {
+      k <- (i - n_burn) / thin
+      tau_draws[k, ]    <- tau
+      lambda_draws[k, ] <- lambda
+      par_draws[k, ]    <- c(sig2_eta, sig2_eps, nu)
+    }
+    if (i %% 10000 == 0) message("iteration ", i)
+  }
+  list(tau = tau_draws, lambda = lambda_draws, par = par_draws)
+}
+```
+
+## Run the fat-tailed model
+
+```{r, cache=TRUE}
+ft <- run_fat_tails(y, sig2_eta_start = unname(fit_sa$coef["epsilon"]),
+                       sig2_eps_start = unname(fit_sa$coef["level"]))
+
+par_summary <- apply(cbind(sd_noise = sqrt(ft$par[, "sig2_eta"]),
+                           sd_step  = sqrt(ft$par[, "sig2_eps"]),
+                           nu       = ft$par[, "nu"]),
+                     2, quantile, c(0.05, 0.50, 0.95))
+par_summary
+
+coda::effectiveSize(coda::mcmc(ft$par))
+summary(coda::effectiveSize(coda::mcmc(ft$tau)))
+```
+
+## Summarize and compare with Stage 1 and UC-SV (smoothed)
+
+```{r}
+q <- function(draws, p) apply(draws, 2, quantile, p)
+
+ft_results <- tibble(
+  date    = results_sa$date,
+  pi_sa   = y,
+  tau_med = q(ft$tau, 0.50),
+  tau_lo  = q(ft$tau, 0.05),
+  tau_hi  = q(ft$tau, 0.95),
+  lambda  = q(ft$lambda, 0.50)
+)
+saveRDS(ft_results, here("data", "state_space", "fat_tails_results.rds"))
+
+ucsv <- readRDS(here("data", "state_space", "ucsv_results.rds"))
+
+compare_models <- ft_results |>
+  select(date, pi_sa, fat_tails = tau_med) |>
+  left_join(select(ucsv, date, ucsv = tau_med), by = "date") |>
+  mutate(stage1 = results_sa$smoothed)
+
+p_models <- compare_models |>
+  pivot_longer(c(stage1, ucsv, fat_tails)) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(aes(y = pi_sa), colour = "grey80") +
+  geom_line() +
+  labs(x = NULL, y = "Annualized inflation (%)", colour = NULL)
+p_models
+ggsave(here("output", "state_space_figures", "trend_three_models.png"),
+       p_models, width = 9, height = 5, dpi = 300)
+```
+
+## Which months does the model treat as extreme?
+
+```{r}
+p_lambda <- ggplot(ft_results, aes(date, lambda)) +
+  geom_col() +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = NULL, y = "Noise variance multiplier (median)")
+p_lambda
+ggsave(here("output", "state_space_figures", "fat_tails_multipliers.png"),
+       p_lambda, width = 9, height = 5, dpi = 300)
+```
+
+## Real-time fat-tailed trend: particle filter
+
+```{r}
+ft_filter <- function(y, sig2_eta, sig2_eps, nu, n_particles = 20000, seed = 2026) {
+  set.seed(seed)
+  n <- length(y); N <- n_particles
+  m <- rep(y[1], N)      # each world's trend estimate
+  P <- rep(1e6, N)       # each world's uncertainty about it
+
+  out <- tibble(tau_med = NA_real_, tau_lo = NA_real_, tau_hi = NA_real_, .rows = n)
+
+  for (t in 1:n) {
+    if (t > 1) P <- P + sig2_eps                             # trend takes one step
+    lambda <- 1 / rgamma(N, shape = nu / 2, rate = nu / 2)   # fresh multiplier per world
+    S      <- P + sig2_eta * lambda
+    logw   <- dnorm(y[t], m, sqrt(S), log = TRUE)            # score each world
+    w      <- exp(logw - max(logw)); w <- w / sum(w)
+
+    K <- P / S                                               # Kalman update per world
+    m <- m + K * (y[t] - m)
+    P <- (1 - K) * P
+
+    idx <- sample.int(N, N, replace = TRUE, prob = w)        # resample
+    m <- m[idx]; P <- P[idx]
+
+    tau_samples    <- rnorm(N, m, sqrt(P))
+    out$tau_med[t] <- median(tau_samples)
+    out$tau_lo[t]  <- quantile(tau_samples, 0.05)
+    out$tau_hi[t]  <- quantile(tau_samples, 0.95)
+  }
+  out
+}
+```
+
+## Run the real-time filter and check the final month
+
+```{r}
+par_med <- apply(ft$par, 2, median)
+
+ft_rt <- ft_filter(y, sig2_eta = par_med["sig2_eta"],
+                      sig2_eps = par_med["sig2_eps"],
+                      nu       = par_med["nu"]) |>
+  mutate(date = results_sa$date, .before = 1)
+
+saveRDS(ft_rt, here("data", "state_space", "fat_tails_realtime.rds"))
+
+c(filter_final = tail(ft_rt$tau_med, 1), mcmc_final = tail(ft_results$tau_med, 1))
+```
+
+## Compare all real-time measures: headline, Mongolbank core, Stage 1, UC-SV, fat tails
+
+```{r}
+comparison_ucsv <- readRDS(here("data", "state_space", "comparison_yoy_ucsv.rds"))
+
+ft_rt_yoy <- ft_rt |>
+  transmute(date,
+            fat_tails_yoy = 100 * (exp(zoo::rollmeanr(tau_med, 12, fill = NA) / 100) - 1))
+
+comparison_all <- comparison_ucsv |>
+  left_join(ft_rt_yoy, by = "date")
+
+saveRDS(comparison_all, here("data", "state_space", "comparison_yoy_all.rds"))
+
+p_compare_all <- comparison_all |>
+  filter(date >= ymd("2023-01-01")) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL)
+p_compare_all
+ggsave(here("output", "state_space_figures", "all_measures_2023_2026.png"),
+       p_compare_all, width = 9, height = 5, dpi = 300)
+
+comparison_all |> filter(date >= ymd("2026-01-01"))
+```

@@ -1,0 +1,481 @@
+---
+title: "03_uc_sv"
+author: "Garid Mendbayar"
+date: "2026-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(stochvol)
+library(Matrix)
+
+dir.create(here("output", "state_space_figures"), showWarnings = FALSE)
+```
+
+## Load the Stage 1 results
+
+```{r}
+results_sa <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+```
+
+## Monthly surprises from the Stage 1 model
+
+```{r}
+surprises <- results_sa |>
+  mutate(surprise = pi_sa - lag(filtered)) |>
+  filter(!is.na(surprise)) |>
+  select(date, surprise)
+
+summary(surprises$surprise)
+```
+
+## The largest surprises
+
+```{r}
+surprises |>
+  arrange(desc(abs(surprise))) |>
+  head(8)
+```
+
+```{r}
+p_surprises <- ggplot(surprises, aes(date, surprise)) +
+  geom_col() +
+  labs(x = NULL, y = "Surprise (annualized pp)")
+p_surprises
+ggsave(here("output", "state_space_figures", "stage1_surprises.png"),
+       p_surprises, width = 9, height = 5, dpi = 300)
+```
+
+## Estimate time-varying volatility of the surprises
+
+```{r}
+set.seed(2026)
+sv_fit <- svsample(surprises$surprise, draws = 10000, burnin = 2000)
+```
+
+## Extract the volatility path
+
+```{r}
+vol_draws <- as.matrix(vola(sv_fit))
+
+surprises <- surprises |>
+  mutate(vol_lo  = apply(vol_draws, 2, quantile, 0.05),
+         vol_med = apply(vol_draws, 2, quantile, 0.50),
+         vol_hi  = apply(vol_draws, 2, quantile, 0.95))
+```
+
+## Plot and save the volatility path
+
+```{r}
+p_sv <- ggplot(surprises, aes(date)) +
+  geom_ribbon(aes(ymin = vol_lo, ymax = vol_hi), alpha = 0.3) +
+  geom_line(aes(y = vol_med)) +
+  geom_hline(yintercept = sd(surprises$surprise), linetype = "dashed") +
+  labs(x = NULL, y = "Size of monthly surprises (sd, annualized pp)")
+p_sv
+ggsave(here("output", "state_space_figures", "sv_surprise_volatility.png"),
+       p_sv, width = 9, height = 5, dpi = 300)
+
+saveRDS(surprises, here("data", "state_space", "sv_surprise_volatility.rds"))
+```
+
+## Volatility model parameters
+
+```{r}
+summary(sv_fit, showlatent = FALSE)
+```
+
+## Robustness: volatility model without 2010
+
+```{r}
+surprises_2011 <- surprises |> filter(date >= ymd("2011-01-01"))
+
+set.seed(2026)
+sv_fit_2011 <- svsample(surprises_2011$surprise, draws = 10000, burnin = 2000)
+summary(sv_fit_2011, showlatent = FALSE)
+```
+
+## Core function: draw a local level path given its variances
+
+```{r}
+sample_local_level <- function(y, obs_var, step_var, init_mean, init_var, draw = TRUE) {
+  n        <- length(y)
+  obs_var  <- rep_len(obs_var, n)
+  step_var <- rep_len(step_var, n - 1)
+
+  H          <- bandSparse(n, k = c(0, -1), diagonals = list(rep(1, n), rep(-1, n - 1)))
+  prior_prec <- Diagonal(x = 1 / c(init_var, step_var))
+  obs_prec   <- Diagonal(x = 1 / obs_var)
+
+  K <- forceSymmetric(t(H) %*% prior_prec %*% H + obs_prec)
+  b <- t(H) %*% prior_prec %*% c(init_mean, rep(0, n - 1)) + obs_prec %*% y
+
+  path_mean <- as.vector(solve(K, b))
+  if (!draw) return(path_mean)
+  path_mean + as.vector(solve(chol(K), rnorm(n)))
+}
+```
+
+## Test: does the function reproduce the Stage 1 smoother?
+
+```{r}
+fit_sa <- StructTS(ts(results_sa$pi_sa, start = c(2010, 3), frequency = 12), type = "level")
+
+tau_check <- sample_local_level(results_sa$pi_sa,
+                                obs_var   = fit_sa$coef["epsilon"],
+                                step_var  = fit_sa$coef["level"],
+                                init_mean = results_sa$pi_sa[1],
+                                init_var  = 1e6,
+                                draw      = FALSE)
+
+summary(abs(tau_check - results_sa$smoothed))
+```
+
+## Draw the log-volatility path given the residuals
+
+```{r}
+# Kim-Shephard-Chib (1998): 7 normals approximating the log chi-square distribution
+ksc_p <- c(0.00730, 0.10556, 0.00002, 0.04395, 0.34001, 0.24566, 0.25750)
+ksc_m <- c(-10.12999, -3.97281, -8.56686, 2.77786, 0.61942, 1.79518, -1.08819) - 1.2704
+ksc_v <- c(5.79596, 2.61369, 5.17950, 0.16735, 0.64009, 0.34023, 1.26261)
+
+sample_log_vol <- function(resid, h, gamma, init_mean, init_var) {
+  ystar <- log(resid^2 + 1e-4)
+
+  # for each month, pick which of the 7 normals the error most plausibly came from
+  dens <- sapply(1:7, function(j) ksc_p[j] * dnorm(ystar, h + ksc_m[j], sqrt(ksc_v[j])))
+  comp <- apply(dens, 1, function(d) sample(7, 1, prob = d))
+
+  # given those picks, the log-volatility is a local level model
+  sample_local_level(ystar - ksc_m[comp], obs_var = ksc_v[comp], step_var = gamma,
+                     init_mean = init_mean, init_var = init_var)
+}
+```
+
+## Test: volatility of Stage 1 residuals, trend held fixed
+
+```{r}
+resid_check <- results_sa$pi_sa - results_sa$smoothed
+h <- rep(log(var(resid_check)), length(resid_check))
+h_draws <- matrix(NA, 2000, length(h))
+
+set.seed(2026)
+for (i in 1:2000) {
+  h <- sample_log_vol(resid_check, h, gamma = 0.2 / 3,
+                      init_mean = log(var(resid_check)), init_var = 10)
+  h_draws[i, ] <- h
+}
+
+vol_check <- apply(exp(h_draws[501:2000, ] / 2), 2, median)
+plot(results_sa$date, vol_check, type = "l",
+     xlab = "", ylab = "Noise volatility (sd, annualized pp)")
+```
+
+## Run the UC-SV Gibbs sampler
+
+```{r, cache=TRUE}
+y      <- results_sa$pi_sa
+n      <- length(y)
+gamma  <- 0.2 / 3       # Stock-Watson's 0.2 per quarter, converted to monthly
+n_burn <- 5000
+n_keep <- 10000
+thin   <- 5          # keep every 5th draw: 50,000 rounds, 10,000 stored
+
+# starting values: Stage 1 smoothed trend and constant volatilities
+tau <- results_sa$smoothed
+h   <- rep(log(var(y - tau)), n)          # noise log-variance, one per month
+g   <- rep(log(var(diff(tau))), n - 1)    # trend-step log-variance, one per step
+h0  <- h[1]
+g0  <- g[1]
+
+tau_draws <- matrix(NA, n_keep, n)
+h_draws   <- matrix(NA, n_keep, n)
+g_draws   <- matrix(NA, n_keep, n - 1)
+
+set.seed(2026)
+for (i in 1:(n_burn + n_keep * thin)) {
+  tau <- sample_local_level(y, obs_var = exp(h), step_var = exp(g),
+                            init_mean = y[1], init_var = 1e6)
+  h   <- sample_log_vol(y - tau,   h, gamma, init_mean = h0, init_var = 10)
+  g   <- sample_log_vol(diff(tau), g, gamma, init_mean = g0, init_var = 10)
+
+    if (i > n_burn && (i - n_burn) %% thin == 0) {
+    k <- (i - n_burn) / thin
+    tau_draws[k, ] <- tau
+    h_draws[k, ]   <- h
+    g_draws[k, ]   <- g
+  }
+  if (i %% 10000 == 0) message("iteration ", i)
+}
+```
+
+## Summarize the UC-SV draws
+
+```{r}
+q <- function(draws, p) apply(draws, 2, quantile, p)
+
+ucsv <- tibble(
+  date      = results_sa$date,
+  pi_sa     = y,
+  stage1    = results_sa$smoothed,
+  tau_med   = q(tau_draws, 0.50),
+  tau_lo    = q(tau_draws, 0.05),
+  tau_hi    = q(tau_draws, 0.95),
+  noise_vol = q(exp(h_draws / 2), 0.50),
+  trend_vol = c(NA, q(exp(g_draws / 2), 0.50))
+)
+
+saveRDS(ucsv, here("data", "state_space", "ucsv_results.rds"))
+```
+
+## Plot the UC-SV trend against Stage 1
+
+```{r}
+p_ucsv_trend <- ggplot(ucsv, aes(date)) +
+  geom_line(aes(y = pi_sa), colour = "grey70") +
+  geom_ribbon(aes(ymin = tau_lo, ymax = tau_hi), fill = "steelblue", alpha = 0.3) +
+  geom_line(aes(y = tau_med), colour = "steelblue") +
+  geom_line(aes(y = stage1), linetype = "dashed") +
+  labs(x = NULL, y = "Annualized inflation (%)")
+p_ucsv_trend
+ggsave(here("output", "state_space_figures", "ucsv_trend_vs_stage1.png"),
+       p_ucsv_trend, width = 9, height = 5, dpi = 300)
+```
+
+## Plot the two volatilities
+
+```{r}
+p_ucsv_vol <- ucsv |>
+  pivot_longer(c(noise_vol, trend_vol), names_to = "component", values_to = "sd") |>
+  ggplot(aes(date, sd, colour = component)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Volatility (sd, annualized pp)", colour = NULL)
+p_ucsv_vol
+ggsave(here("output", "state_space_figures", "ucsv_volatilities.png"),
+       p_ucsv_vol, width = 9, height = 5, dpi = 300)
+```
+
+## Convergence: trace plots
+
+```{r}
+idx <- function(d) which(results_sa$date == ymd(d))
+
+trace_df <- tibble(
+  iter                  = 1:n_keep,
+  `trend, Jan 2018`     = tau_draws[, idx("2018-01-01")],
+  `trend, Aug 2026`     = tau_draws[, n],
+  `noise vol, Aug 2010` = exp(h_draws[, idx("2010-08-01")] / 2),
+  `trend vol, Jan 2021` = exp(g_draws[, idx("2021-01-01") - 1] / 2)
+)
+
+p_trace <- trace_df |>
+  pivot_longer(-iter) |>
+  ggplot(aes(iter, value)) +
+  geom_line(linewidth = 0.2) +
+  facet_wrap(~ name, scales = "free_y", ncol = 1) +
+  labs(x = "MCMC iteration (after burn-in)", y = NULL)
+p_trace
+ggsave(here("output", "state_space_figures", "ucsv_trace_plots.png"),
+       p_trace, width = 9, height = 8, dpi = 300)
+```
+
+## Convergence: effective sample size
+
+```{r}
+ess <- function(draws) coda::effectiveSize(coda::mcmc(draws))
+
+summary(ess(tau_draws))   # trend, one value per month
+summary(ess(h_draws))     # noise log-volatility
+summary(ess(g_draws))     # trend log-volatility
+```
+
+## Trend volatility with its uncertainty band
+
+```{r}
+trend_vol_band <- tibble(
+  date = results_sa$date[-1],
+  med  = q(exp(g_draws / 2), 0.50),
+  lo   = q(exp(g_draws / 2), 0.05),
+  hi   = q(exp(g_draws / 2), 0.95)
+)
+
+p_trend_vol <- ggplot(trend_vol_band, aes(date)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.3) +
+  geom_line(aes(y = med)) +
+  labs(x = NULL, y = "Trend volatility (sd, annualized pp)")
+p_trend_vol
+ggsave(here("output", "state_space_figures", "ucsv_trend_vol_band.png"),
+       p_trend_vol, width = 9, height = 5, dpi = 300)
+```
+
+## UC-SV sampler as a reusable function
+
+```{r}
+run_ucsv <- function(y, tau_start, gamma, n_burn = 5000, n_keep = 10000, thin = 5, seed = 2026) {
+  n   <- length(y)
+  tau <- tau_start
+  h   <- rep(log(var(y - tau)), n)
+  g   <- rep(log(var(diff(tau))), n - 1)
+  h0  <- h[1]
+  g0  <- g[1]
+
+  tau_draws <- matrix(NA, n_keep, n)
+  h_draws   <- matrix(NA, n_keep, n)
+  g_draws   <- matrix(NA, n_keep, n - 1)
+
+  set.seed(seed)
+  for (i in 1:(n_burn + n_keep * thin)) {
+    tau <- sample_local_level(y, obs_var = exp(h), step_var = exp(g),
+                              init_mean = y[1], init_var = 1e6)
+    h   <- sample_log_vol(y - tau,   h, gamma, init_mean = h0, init_var = 10)
+    g   <- sample_log_vol(diff(tau), g, gamma, init_mean = g0, init_var = 10)
+
+    if (i > n_burn && (i - n_burn) %% thin == 0) {
+      k <- (i - n_burn) / thin
+      tau_draws[k, ] <- tau
+      h_draws[k, ]   <- h
+      g_draws[k, ]   <- g
+    }
+    if (i %% 10000 == 0) message("iteration ", i)
+  }
+
+  list(tau = tau_draws, h = h_draws, g = g_draws)
+}
+```
+
+## Sensitivity: rerun UC-SV with gamma = 0.2
+
+```{r}
+ucsv_fast <- run_ucsv(y, tau_start = results_sa$smoothed, gamma = 0.2)
+
+ucsv_g02 <- tibble(
+  date         = results_sa$date,
+  tau_med      = q(ucsv_fast$tau, 0.50),
+  noise_vol    = q(exp(ucsv_fast$h / 2), 0.50),
+  trend_vol    = c(NA, q(exp(ucsv_fast$g / 2), 0.50)),
+  trend_vol_lo = c(NA, q(exp(ucsv_fast$g / 2), 0.05)),
+  trend_vol_hi = c(NA, q(exp(ucsv_fast$g / 2), 0.95))
+)
+saveRDS(ucsv_g02, here("data", "state_space", "ucsv_results_gamma02.rds"))
+
+summary(ess(ucsv_fast$g))
+```
+
+## Compare gamma = 0.067 (main) with gamma = 0.2
+
+```{r}
+compare_gamma <- bind_rows(
+  ucsv     |> transmute(date, tau_med, noise_vol, trend_vol, gamma = "0.067 (main)"),
+  ucsv_g02 |> transmute(date, tau_med, noise_vol, trend_vol, gamma = "0.2 (Stock-Watson)")
+) |>
+  pivot_longer(c(tau_med, noise_vol, trend_vol), names_to = "series") |>
+  mutate(series = recode(series,
+                         tau_med   = "Trend",
+                         noise_vol = "Noise volatility",
+                         trend_vol = "Trend volatility"))
+
+p_gamma <- ggplot(compare_gamma, aes(date, value, colour = gamma)) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ series, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = "Annualized pp", colour = "gamma")
+p_gamma
+ggsave(here("output", "state_space_figures", "ucsv_gamma_sensitivity.png"),
+       p_gamma, width = 9, height = 8, dpi = 300)
+```
+
+## Real-time UC-SV trend: particle filter
+
+```{r}
+ucsv_filter <- function(y, gamma, h_init, g_init, init_var = 10,
+                        n_particles = 20000, seed = 2026) {
+  set.seed(seed)
+  n <- length(y); N <- n_particles
+
+  h <- rnorm(N, h_init, sqrt(init_var))   # noise log-variance, per world
+  g <- rnorm(N, g_init, sqrt(init_var))   # trend-step log-variance, per world
+  m <- rep(y[1], N)                       # each world's trend estimate
+  P <- rep(1e6, N)                        # each world's uncertainty about it
+
+  out <- tibble(tau_med = NA_real_, tau_lo = NA_real_, tau_hi = NA_real_,
+                noise_vol = NA_real_, trend_vol = NA_real_, .rows = n)
+
+  for (t in 1:n) {
+    # 1. move: volatilities drift, trend uncertainty grows by one step
+    if (t > 1) {
+      if (t > 2) g <- g + rnorm(N, 0, sqrt(gamma))
+      h <- h + rnorm(N, 0, sqrt(gamma))
+      P <- P + exp(g)
+    }
+    # 2. predict and score: how likely was this month's inflation in each world?
+    S    <- P + exp(h)
+    logw <- dnorm(y[t], m, sqrt(S), log = TRUE)
+    w    <- exp(logw - max(logw)); w <- w / sum(w)
+
+    # 3. update: ordinary Kalman filter step within each world
+    K <- P / S
+    m <- m + K * (y[t] - m)
+    P <- (1 - K) * P
+
+    # 4. resample: keep good worlds, drop poor ones
+    idx <- sample.int(N, N, replace = TRUE, prob = w)
+    h <- h[idx]; g <- g[idx]; m <- m[idx]; P <- P[idx]
+
+    tau_samples <- rnorm(N, m, sqrt(P))
+    out$tau_med[t]   <- median(tau_samples)
+    out$tau_lo[t]    <- quantile(tau_samples, 0.05)
+    out$tau_hi[t]    <- quantile(tau_samples, 0.95)
+    out$noise_vol[t] <- median(exp(h / 2))
+    out$trend_vol[t] <- if (t > 1) median(exp(g / 2)) else NA
+  }
+  out
+}
+```
+
+## Run the real-time filter and check it against the MCMC
+
+```{r}
+ucsv_rt <- ucsv_filter(y, gamma = 0.2 / 3,
+                       h_init = log(var(y - results_sa$smoothed)),
+                       g_init = log(var(diff(results_sa$smoothed)))) |>
+  mutate(date = results_sa$date, .before = 1)
+
+saveRDS(ucsv_rt, here("data", "state_space", "ucsv_realtime.rds"))
+
+# final month: real-time and full-sample use the same data, so they should agree
+c(filter_final = tail(ucsv_rt$tau_med, 1), mcmc_final = tail(ucsv$tau_med, 1))
+```
+
+## Compare real-time UC-SV with Stage 1, headline and Mongolbank core
+
+```{r}
+comparison <- readRDS(here("data", "state_space", "comparison_yoy.rds"))
+
+ucsv_rt_yoy <- ucsv_rt |>
+  transmute(date,
+            ucsv_yoy = 100 * (exp(zoo::rollmeanr(tau_med, 12, fill = NA) / 100) - 1))
+
+comparison_ucsv <- comparison |>
+  rename(stage1_yoy = trend_yoy) |>
+  left_join(ucsv_rt_yoy, by = "date")
+
+p_compare_ucsv <- comparison_ucsv |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL)
+p_compare_ucsv
+ggsave(here("output", "state_space_figures", "ucsv_vs_stage1_headline_core.png"),
+       p_compare_ucsv, width = 9, height = 5, dpi = 300)
+
+saveRDS(comparison_ucsv, here("data", "state_space", "comparison_yoy_ucsv.rds"))
+
+comparison_ucsv |> filter(date == max(date))
+```
