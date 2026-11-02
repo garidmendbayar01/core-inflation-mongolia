@@ -1,0 +1,215 @@
+---
+title: "05_robustness"
+author: "Garid Mendbayar"
+date: "2026-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(Matrix)
+
+source(here("Kalman filtering", "ssm_functions.R"))
+dir.create(here("output", "state_space_figures"), showWarnings = FALSE)
+
+q <- function(draws, p) apply(draws, 2, quantile, p)
+```
+
+## Load main results
+
+```{r}
+results_sa <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+ft_main    <- readRDS(here("data", "state_space", "fat_tails_results.rds"))
+```
+
+## Robustness A: drop 2010 (start January 2011)
+
+```{r, cache=TRUE}
+sa11 <- results_sa |> filter(date >= ymd("2011-01-01"))
+y11  <- sa11$pi_sa
+
+# Stage 1 on the shorter sample
+fit11 <- StructTS(ts(y11, start = c(2011, 1), frequency = 12), type = "level")
+q11   <- unname(fit11$coef["level"] / fit11$coef["epsilon"])
+c(sd_step  = sqrt(unname(fit11$coef["level"])),
+  sd_noise = sqrt(unname(fit11$coef["epsilon"])),
+  K        = (-q11 + sqrt(q11^2 + 4 * q11)) / 2)
+
+# Fat-tailed model on the shorter sample
+ft11 <- run_fat_tails(y11, sig2_eta_start = unname(fit11$coef["epsilon"]),
+                           sig2_eps_start = unname(fit11$coef["level"]))
+apply(cbind(sd_noise = sqrt(ft11$par[, "sig2_eta"]),
+            sd_step  = sqrt(ft11$par[, "sig2_eps"]),
+            nu       = ft11$par[, "nu"]),
+      2, quantile, c(0.05, 0.50, 0.95))
+
+# How much does the fat-tailed trend change?
+robust_2011 <- tibble(date = sa11$date, ft_2011 = q(ft11$tau, 0.50)) |>
+  left_join(select(ft_main, date, ft_main = tau_med), by = "date")
+summary(abs(robust_2011$ft_2011 - robust_2011$ft_main))
+
+saveRDS(robust_2011, here("data", "state_space", "robust_2011_fat_tails.rds"))
+
+robust_2011 |> mutate(diff = abs(ft_2011 - ft_main)) |> arrange(desc(diff)) |> head(5)
+```
+
+
+
+## Robustness A (continued): UC-SV from 2011
+
+```{r, cache=TRUE}
+ucsv_main <- readRDS(here("data", "state_space", "ucsv_results.rds"))
+
+ucsv11 <- run_ucsv(y11, tau_start = as.numeric(tsSmooth(fit11)), gamma = 0.2 / 3)
+
+robust_2011_ucsv <- tibble(
+  date           = sa11$date,
+  tau_2011       = q(ucsv11$tau, 0.50),
+  noise_2011     = q(exp(ucsv11$h / 2), 0.50),
+  trend_vol_2011 = c(NA, q(exp(ucsv11$g / 2), 0.50))
+) |>
+  left_join(select(ucsv_main, date, tau_main = tau_med,
+                   noise_main = noise_vol, trend_vol_main = trend_vol), by = "date")
+saveRDS(robust_2011_ucsv, here("data", "state_space", "robust_2011_ucsv.rds"))
+
+summary(abs(robust_2011_ucsv$tau_2011 - robust_2011_ucsv$tau_main))
+summary(coda::effectiveSize(coda::mcmc(ucsv11$g)))
+
+p_r11 <- robust_2011_ucsv |>
+  select(date, noise_2011, noise_main, trend_vol_2011, trend_vol_main) |>
+  pivot_longer(-date) |>
+  mutate(component = if_else(str_starts(name, "noise"), "Noise volatility", "Trend volatility"),
+         sample    = if_else(str_ends(name, "2011"), "from 2011", "from 2010 (main)")) |>
+  ggplot(aes(date, value, colour = sample)) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ component, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = "sd, annualized pp", colour = NULL)
+p_r11
+ggsave(here("output", "state_space_figures", "robust_2011_ucsv_volatilities.png"),
+       p_r11, width = 9, height = 6, dpi = 300)
+```
+
+## Robustness B: 2015-base sample (2006-2022)
+
+```{r, cache=TRUE}
+pi_2015 <- readRDS(here("data", "state_space", "headline_pi_2015base.rds"))
+
+# Seasonally adjust the 2015-base index with X-13, same as the main series
+sa15    <- seasonal::seas(ts(pi_2015$index, start = c(2006, 2), frequency = 12))
+y15     <- as.numeric(1200 * diff(log(seasonal::final(sa15))))
+dates15 <- seq(ymd("2006-03-01"), ymd("2022-07-01"), by = "month")
+stopifnot(length(y15) == length(dates15))
+
+# Stage 1
+fit15 <- StructTS(ts(y15, start = c(2006, 3), frequency = 12), type = "level")
+q15   <- unname(fit15$coef["level"] / fit15$coef["epsilon"])
+c(sd_step  = sqrt(unname(fit15$coef["level"])),
+  sd_noise = sqrt(unname(fit15$coef["epsilon"])),
+  K        = (-q15 + sqrt(q15^2 + 4 * q15)) / 2)
+
+# Fat-tailed model
+ft15 <- run_fat_tails(y15, sig2_eta_start = unname(fit15$coef["epsilon"]),
+                           sig2_eps_start = unname(fit15$coef["level"]))
+apply(cbind(sd_noise = sqrt(ft15$par[, "sig2_eta"]),
+            sd_step  = sqrt(ft15$par[, "sig2_eps"]),
+            nu       = ft15$par[, "nu"]),
+      2, quantile, c(0.05, 0.50, 0.95))
+
+# Compare trends with the main (2023-base) results where they overlap
+robust_2015 <- tibble(date        = dates15,
+                      stage1_2015 = as.numeric(tsSmooth(fit15)),
+                      ft_2015     = q(ft15$tau, 0.50)) |>
+  left_join(select(results_sa, date, stage1_main = smoothed), by = "date") |>
+  left_join(select(ft_main,    date, ft_main     = tau_med),  by = "date")
+saveRDS(robust_2015, here("data", "state_space", "robust_2015base.rds"))
+
+robust_2015 |>
+  filter(!is.na(ft_main)) |>
+  group_by(year = year(date)) |>
+  summarise(stage1_gap = mean(abs(stage1_2015 - stage1_main)),
+            ft_gap     = mean(abs(ft_2015 - ft_main)))
+
+p_r15 <- robust_2015 |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Annualized inflation (%)", colour = NULL)
+p_r15
+ggsave(here("output", "state_space_figures", "robust_2015base_trends.png"),
+       p_r15, width = 9, height = 5, dpi = 300)
+```
+
+## Robustness B (continued): same window, different base year
+
+```{r, cache=TRUE}
+win  <- function(d) d >= ymd("2010-03-01") & d <= ymd("2022-07-01")
+y15w <- y15[win(dates15)]
+y23w <- results_sa$pi_sa[win(results_sa$date)]
+
+fit15w <- StructTS(ts(y15w, start = c(2010, 3), frequency = 12), type = "level")
+fit23w <- StructTS(ts(y23w, start = c(2010, 3), frequency = 12), type = "level")
+rbind(base2015 = sqrt(fit15w$coef), base2023 = sqrt(fit23w$coef))
+
+base_window <- tibble(date     = results_sa$date[win(results_sa$date)],
+                      base2015 = as.numeric(tsSmooth(fit15w)),
+                      base2023 = as.numeric(tsSmooth(fit23w)))
+saveRDS(base_window, here("data", "state_space", "robust_base_same_window.rds"))
+
+base_window |>
+  group_by(year = year(date)) |>
+  summarise(gap = mean(abs(base2015 - base2023)))
+```
+
+## Robustness B (continued): UC-SV on 2006-2022 — does trend volatility spike in 2008?
+
+```{r, cache=TRUE}
+ucsv15 <- run_ucsv(y15, tau_start = as.numeric(tsSmooth(fit15)), gamma = 0.2 / 3)
+
+ucsv15_results <- tibble(
+  date         = dates15,
+  tau_med      = q(ucsv15$tau, 0.50),
+  noise_vol    = q(exp(ucsv15$h / 2), 0.50),
+  trend_vol    = c(NA, q(exp(ucsv15$g / 2), 0.50)),
+  trend_vol_lo = c(NA, q(exp(ucsv15$g / 2), 0.05)),
+  trend_vol_hi = c(NA, q(exp(ucsv15$g / 2), 0.95))
+)
+saveRDS(ucsv15_results, here("data", "state_space", "robust_2015base_ucsv.rds"))
+
+summary(coda::effectiveSize(coda::mcmc(ucsv15$g)))
+
+# Trend volatility at a few key dates, with 90% bands
+ucsv15_results |>
+  filter(date %in% ymd(c("2008-06-01", "2012-01-01", "2016-01-01", "2018-06-01", "2021-06-01"))) |>
+  select(date, trend_vol, trend_vol_lo, trend_vol_hi)
+
+vol_long <- bind_rows(
+  ucsv15_results |> transmute(date, component = "Trend volatility",
+                              med = trend_vol, lo = trend_vol_lo, hi = trend_vol_hi),
+  ucsv15_results |> transmute(date, component = "Noise volatility",
+                              med = noise_vol, lo = NA_real_, hi = NA_real_)
+)
+
+p_ucsv15 <- ggplot(vol_long, aes(date)) +
+    geom_ribbon(data = filter(vol_long, !is.na(lo)),
+              aes(ymin = lo, ymax = hi), alpha = 0.3) +
+  geom_line(aes(y = med), na.rm = TRUE) +
+  facet_wrap(~ component, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = "sd, annualized pp")
+p_ucsv15
+ggsave(here("output", "state_space_figures", "robust_2015base_ucsv_volatilities.png"),
+       p_ucsv15, width = 9, height = 6, dpi = 300)
+
+i08 <- which(dates15 == ymd("2008-06-01")) - 1
+i18 <- which(dates15 == ymd("2018-06-01")) - 1
+mean(ucsv15$g[, i08] > ucsv15$g[, i18])
+```
+
+
+
