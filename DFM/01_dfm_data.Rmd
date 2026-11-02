@@ -1,0 +1,144 @@
+---
+title: "01_dfm_data"
+author: "Garid Mendbayar"
+date: "2026-09-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(readxl)
+library(tidyverse)
+
+dir.create(here("data", "dfm"), showWarnings = FALSE)
+dir.create(here("output", "dfm_figures"), showWarnings = FALSE)
+```
+
+## Read the NSO division indices (2023 base)
+
+```{r}
+raw <- read_excel(here("data", "raw", "nso_cpi_groups_2026-09-28.xlsx"), sheet = 1, skip = 1)
+
+cpi_long <- raw |>
+  rename(base = 1, group = 2) |>
+  pivot_longer(-c(base, group), names_to = "month", values_to = "index") |>
+  mutate(index = as.numeric(index), date = ym(month)) |>
+  filter(!is.na(index))
+
+div <- cpi_long |>
+  filter(str_sub(base, 1, 4) == "2023", !str_detect(group, "^Ерөнхий")) |>
+  select(date, group, index)
+```
+
+## Short English codes for the 13 divisions
+
+```{r}
+codes <- c("Хүнс" = "food",           "Согт" = "alcohol_tobacco",
+           "Хувц" = "clothing",       "Орон" = "housing_utilities",
+           "Гэр " = "furnishings",    "Эм т" = "health",
+           "Тээв" = "transport",      "Холб" = "communication",
+           "Амра" = "recreation",     "Боло" = "education",
+           "Зочи" = "restaurants_hotels", "Даат" = "insurance_finance",
+           "Буса" = "other")
+
+div <- div |> mutate(code = unname(codes[str_sub(group, 1, 4)]))
+stopifnot(!any(is.na(div$code)))
+
+div |> group_by(code) |> summarise(start = min(date), end = max(date), months = n())
+
+saveRDS(div, here("data", "dfm", "division_indices_2023base.rds"))
+```
+
+## Keep the 12 divisions with full history
+
+```{r}
+div12 <- div |> filter(code != "insurance_finance")
+```
+
+## Seasonally adjust each division and compute monthly inflation
+
+```{r}
+sa_one <- function(idx, code) {
+  tryCatch(
+    as.numeric(seasonal::final(seasonal::seas(ts(idx, start = c(2010, 1), frequency = 12)))),
+    error = function(e) { message("X-13 failed for ", code, ", using unadjusted"); idx }
+  )
+}
+
+div_sa <- div12 |>
+  arrange(code, date) |>
+  group_by(code) |>
+  mutate(index_sa = sa_one(index, first(code)),
+         pi_sa    = 1200 * log(index_sa / lag(index_sa))) |>
+  ungroup() |>
+  filter(!is.na(pi_sa))
+
+div_sa |>
+  group_by(code) |>
+  summarise(mean = mean(pi_sa), sd = sd(pi_sa), months = n()) |>
+  arrange(desc(sd))
+
+saveRDS(div_sa, here("data", "dfm", "division_inflation_sa.rds"))
+```
+
+## Look at all 12 series
+
+```{r}
+p_div <- ggplot(div_sa, aes(date, pi_sa)) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(~ code, ncol = 3, scales = "free_y") +
+  labs(x = NULL, y = "Annualized monthly inflation, SA (%)")
+p_div
+ggsave(here("output", "dfm_figures", "division_inflation_sa.png"),
+       p_div, width = 10, height = 9, dpi = 300)
+```
+
+## Drop education and communication (administered, once-a-year price changes)
+
+```{r}
+div11 <- div_sa |> filter(!code %in% c("education", "communication"))
+```
+
+## Outlier adjustment (Stock-Watson rule) and standardization
+
+```{r}
+sw_clean <- function(x, k = 6) {
+  out <- abs(x - median(x)) > k * IQR(x)
+  for (t in which(out)) {
+    x[t] <- if (t > 1) median(x[max(1, t - 5):(t - 1)]) else median(x)
+  }
+  x
+}
+
+div_clean <- div11 |>
+  group_by(code) |>
+  mutate(pi_clean = sw_clean(pi_sa),
+         outlier  = pi_clean != pi_sa,
+         z        = (pi_clean - mean(pi_clean)) / sd(pi_clean)) |>
+  ungroup()
+
+div_clean |>
+  group_by(code) |>
+  summarise(outliers = sum(outlier)) |>
+  arrange(desc(outliers))
+
+X <- div_clean |>
+  select(date, code, z) |>
+  pivot_wider(names_from = code, values_from = z) |>
+  arrange(date)
+
+dim(X)
+
+saveRDS(div_clean, here("data", "dfm", "division_inflation_clean.rds"))
+saveRDS(X,         here("data", "dfm", "panel_standardized.rds"))
+```
+
+
+
+

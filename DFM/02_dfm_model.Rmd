@@ -1,0 +1,181 @@
+---
+title: "02_dfm_model"
+author: "Garid Mendbayar"
+date: "2026-09-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+```
+
+## Load the standardized panel
+
+```{r}
+X  <- readRDS(here("data", "dfm", "panel_standardized.rds"))
+Xm <- as.matrix(select(X, -date))
+```
+
+## Principal components
+
+```{r}
+pca <- prcomp(Xm, center = FALSE, scale. = FALSE)   # already standardized
+
+# how much of the panel's movement each component captures
+round(summary(pca)$importance[, 1:5], 3)
+
+# loadings on the first component (sign chosen so most are positive)
+if (sum(pca$rotation[, 1]) < 0) pca$rotation[, 1] <- -pca$rotation[, 1]
+sort(round(pca$rotation[, 1], 2), decreasing = TRUE)
+```
+
+## Plot the first component against headline
+
+```{r}
+results_sa <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+
+pc1 <- tibble(date = X$date, pc1 = as.numeric(Xm %*% pca$rotation[, 1])) |>
+  left_join(select(results_sa, date, headline = pi_sa), by = "date") |>
+  mutate(across(c(pc1, headline), ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE)))
+
+p_pc1 <- pc1 |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Standardized", colour = NULL)
+p_pc1
+ggsave(here("output", "dfm_figures", "pc1_vs_headline.png"),
+       p_pc1, width = 9, height = 5, dpi = 300)
+```
+
+## Step 5: DFM parameters from the principal components
+
+```{r}
+v      <- pca$rotation[, 1]
+d1     <- pca$sdev[1]^2
+f_pc   <- as.numeric(Xm %*% v) / sqrt(d1)   # PCA factor, scaled to variance 1
+lambda <- v * sqrt(d1)                      # loadings
+psi    <- apply(Xm - outer(f_pc, lambda), 2, var)   # each division's own noise variance
+
+ar1    <- arima(f_pc, order = c(1, 0, 0), include.mean = FALSE)
+phi    <- unname(ar1$coef["ar1"])
+sig2_u <- ar1$sigma2
+
+tibble(code         = names(lambda),
+       loading      = round(lambda, 2),
+       noise_var    = round(psi, 2),
+       share_common = round(lambda^2 / (lambda^2 + psi), 2)) |>
+  arrange(desc(share_common))
+
+c(phi = phi, sig2_u = sig2_u)
+
+dfm_params <- list(lambda = lambda, psi = psi, phi = phi, sig2_u = sig2_u)
+saveRDS(dfm_params, here("data", "dfm", "dfm_params.rds"))
+```
+
+## Step 6: Kalman filter for the common factor
+
+```{r}
+dfm_filter <- function(Xm, lambda, psi, phi, sig2_u) {
+  n      <- nrow(Xm)
+  f_filt <- numeric(n)
+  P_filt <- numeric(n)
+  f_prev <- 0
+  P_prev <- sig2_u / (1 - phi^2)            # start from the factor's long-run spread
+  info   <- sum(lambda^2 / psi)             # total reliability of one month's data
+
+  for (t in 1:n) {
+    f_pred <- phi * f_prev                  # 1. predict from last month
+    P_pred <- phi^2 * P_prev + sig2_u
+    P_filt[t] <- 1 / (1 / P_pred + info)    # 2. combine prediction with this month's votes
+    f_filt[t] <- P_filt[t] * (f_pred / P_pred + sum(lambda * Xm[t, ] / psi))
+    f_prev <- f_filt[t]
+    P_prev <- P_filt[t]
+  }
+  tibble(f_filt, P_filt)
+}
+
+filt <- dfm_filter(Xm, lambda, psi, phi, sig2_u) |>
+  mutate(date = X$date, f_pc = f_pc, .before = 1)
+saveRDS(filt, here("data", "dfm", "dfm_filtered_factor.rds"))
+
+# checks
+cor(filt$f_filt, filt$f_pc)
+round(sort(lambda^2 / psi / sum(lambda^2 / psi), decreasing = TRUE), 2)
+```
+
+## Plot: filtered factor vs PCA factor
+
+```{r}
+p_filt <- filt |>
+  select(date, `Kalman filter` = f_filt, PCA = f_pc) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line() +
+  labs(x = NULL, y = "Common factor (standardized)", colour = NULL)
+p_filt
+ggsave(here("output", "dfm_figures", "factor_filtered_vs_pca.png"),
+       p_filt, width = 9, height = 5, dpi = 300)
+```
+
+## Step 7: DFM core inflation (headline projected on the factor)
+
+```{r}
+results_sa <- readRDS(here("data", "state_space", "local_level_sa_results.rds"))
+
+core_df <- filt |>
+  select(date, f_filt) |>
+  inner_join(select(results_sa, date, pi_sa), by = "date")
+
+reg <- lm(pi_sa ~ f_filt, data = core_df)
+coef(reg)
+summary(reg)$r.squared
+
+core_df <- core_df |>
+  mutate(dfm_core = coef(reg)[1] + coef(reg)[2] * f_filt,
+         dfm_yoy  = 100 * (exp(zoo::rollmeanr(dfm_core, 12, fill = NA) / 100) - 1))
+saveRDS(core_df, here("data", "dfm", "dfm_core.rds"))
+```
+
+## Compare with all other measures
+
+```{r}
+comparison_dfm <- readRDS(here("data", "state_space", "comparison_yoy_all.rds")) |>
+  left_join(select(core_df, date, dfm_yoy), by = "date")
+saveRDS(comparison_dfm, here("data", "dfm", "comparison_yoy_with_dfm.rds"))
+
+p_dfm <- comparison_dfm |>
+  filter(date >= ymd("2017-01-01")) |>
+  pivot_longer(-date) |>
+  ggplot(aes(date, value, colour = name)) +
+  geom_line(na.rm = TRUE) +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL)
+p_dfm
+ggsave(here("output", "dfm_figures", "dfm_vs_all_measures.png"),
+       p_dfm, width = 9, height = 5, dpi = 300)
+
+comparison_dfm |> filter(date >= ymd("2025-10-01")) |> print(width = Inf)
+```
+
+## Diagnostic: year-over-year inflation by division, winter 2025-26
+
+```{r}
+div <- readRDS(here("data", "dfm", "division_indices_2023base.rds"))
+
+div |>
+  group_by(code) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(yoy = round(100 * (index / lag(index, 12) - 1), 1)) |>
+  ungroup() |>
+  filter(date %in% ymd(c("2025-10-01", "2026-02-01", "2026-08-01"))) |>
+  select(code, date, yoy) |>
+  pivot_wider(names_from = date, values_from = yoy) |>
+  arrange(`2026-02-01`)
+```

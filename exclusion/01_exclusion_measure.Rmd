@@ -1,0 +1,215 @@
+---
+title: "01_exclusion_measure"
+author: "Garid Mendbayar"
+date: "2026-09-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+
+dir.create(here("data", "exclusion"), showWarnings = FALSE)
+dir.create(here("output", "exclusion_figures"), showWarnings = FALSE)
+```
+
+## Step 1: Recover the 2023 basket weights
+
+```{r}
+div     <- readRDS(here("data", "dfm", "division_indices_2023base.rds"))
+pi_2023 <- readRDS(here("data", "state_space", "headline_pi_2023base.rds"))
+
+wide <- div |>
+  select(date, code, index) |>
+  pivot_wider(names_from = code, values_from = index) |>
+  inner_join(select(pi_2023, date, headline = index), by = "date") |>
+  filter(date >= ymd("2024-01-01"))
+
+fit_w <- lm(headline ~ . - 1, data = select(wide, -date))
+w     <- coef(fit_w)
+
+round(sort(w, decreasing = TRUE), 3)
+sum(w)
+max(abs(residuals(fit_w)))
+
+saveRDS(w, here("data", "exclusion", "division_weights_2023.rds"))
+```
+
+
+## Step 1b: Constrained weights (non-negative, sum to 1)
+
+```{r}
+X <- as.matrix(select(wide, -date, -headline))
+y <- wide$headline
+
+sol <- quadprog::solve.QP(
+  Dmat = crossprod(X),
+  dvec = crossprod(X, y),
+  Amat = cbind(rep(1, ncol(X)), diag(ncol(X))),
+  bvec = c(1, rep(0, ncol(X))),
+  meq  = 1
+)
+w_c <- setNames(sol$solution, colnames(X))
+
+round(sort(w_c, decreasing = TRUE), 3)
+max(abs(y - X %*% w_c))
+
+saveRDS(w_c, here("data", "exclusion", "division_weights_2023.rds"))
+```
+
+```{r}
+w_off <- c(food = 26.662467, alcohol_tobacco = 1.016744, clothing = 12.857192,
+           housing_utilities = 9.511357, furnishings = 4.828691, health = 7.32321,
+           transport = 16.71729, communication = 5.807952, recreation = 1.539559,
+           education = 5.28623, restaurants_hotels = 2.409491,
+           insurance_finance = 0.434471, other = 5.605346) / 100
+
+fit_off <- X[, names(w_off)] %*% w_off
+max(abs(y - fit_off))
+mean(abs(y - fit_off))
+```
+
+
+## Step 2: Build exclusion measures and compare with the official core
+
+```{r}
+w_use <- w_off[names(w_off) != "insurance_finance"]
+
+build_excl <- function(exclude) {
+  keep <- setdiff(names(w_use), exclude)
+  div |>
+    filter(code %in% keep) |>
+    mutate(wt = w_use[code]) |>
+    group_by(date) |>
+    summarise(index = sum(wt * index) / sum(wt), n = n(), .groups = "drop")
+}
+
+ex_food <- build_excl("food")
+ex_fe   <- build_excl(c("food", "housing_utilities", "transport"))
+table(ex_food$n); table(ex_fe$n)          # every month should use all kept divisions
+
+boa <- readRDS(here("data", "state_space", "mongolbank_inflation.rds"))
+
+excl <- ex_food |>
+  select(date, ex_food = index) |>
+  left_join(select(ex_fe, date, ex_fe = index), by = "date") |>
+  arrange(date) |>
+  mutate(ex_food_yoy = 100 * (ex_food / lag(ex_food, 12) - 1),
+         ex_fe_yoy   = 100 * (ex_fe   / lag(ex_fe,   12) - 1)) |>
+  left_join(select(boa, date, core_yoy, headline_yoy = national_yoy), by = "date")
+saveRDS(excl, here("data", "exclusion", "exclusion_measures.rds"))
+
+# How closely does each track the official core (Jan 2024 onward)?
+excl |>
+  filter(!is.na(core_yoy)) |>
+  summarise(cor_ex_food  = cor(ex_food_yoy, core_yoy),
+            gap_ex_food  = mean(abs(ex_food_yoy - core_yoy)),
+            cor_ex_fe    = cor(ex_fe_yoy, core_yoy),
+            gap_ex_fe    = mean(abs(ex_fe_yoy - core_yoy)))
+
+p_excl <- excl |>
+  filter(date >= ymd("2023-01-01")) |>
+  select(date, headline_yoy, core_yoy, ex_food_yoy, ex_fe_yoy) |>
+  pivot_longer(-date) |>
+  mutate(name = factor(name,
+           levels = c("headline_yoy", "core_yoy", "ex_food_yoy", "ex_fe_yoy"),
+           labels = c("Headline", "Official core (Bank of Mongolia)",
+                      "Ex-food", "Ex-food and energy"))) |>
+  ggplot(aes(date, value, colour = name, linetype = name)) +
+  geom_line(linewidth = 0.6, na.rm = TRUE) +
+  scale_colour_manual(values = c("grey60", "black", "#1f4e79", "#c0504d")) +
+  scale_linetype_manual(values = c("solid", "solid", "solid", "dashed")) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL, linetype = NULL,
+       caption = "Source: National Statistics Office of Mongolia; Bank of Mongolia; author's calculations.") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.caption = element_text(hjust = 0, colour = "grey30", size = 9),
+        axis.text = element_text(colour = "black"))
+p_excl
+
+ggsave(here("output", "exclusion_figures", "exclusion_vs_official_core.png"),
+       p_excl, width = 6.5, height = 4, dpi = 300)
+ggsave(here("output", "exclusion_figures", "exclusion_vs_official_core.pdf"),
+       p_excl, width = 6.5, height = 4)
+```
+
+## Step 2b: Test a third variant (exclude food and transport, keep utilities)
+
+```{r}
+ex_ft <- build_excl(c("food", "transport"))
+
+excl <- excl |>
+  left_join(select(ex_ft, date, ex_ft = index), by = "date") |>
+  mutate(ex_ft_yoy = 100 * (ex_ft / lag(ex_ft, 12) - 1))
+saveRDS(excl, here("data", "exclusion", "exclusion_measures.rds"))
+
+excl |>
+  filter(!is.na(core_yoy)) |>
+  summarise(cor_ex_food = cor(ex_food_yoy, core_yoy), gap_ex_food = mean(abs(ex_food_yoy - core_yoy)),
+            cor_ex_ft   = cor(ex_ft_yoy,   core_yoy), gap_ex_ft   = mean(abs(ex_ft_yoy   - core_yoy)),
+            cor_ex_fe   = cor(ex_fe_yoy,   core_yoy), gap_ex_fe   = mean(abs(ex_fe_yoy   - core_yoy)))
+```
+
+## Figure 4: comparing core measures (year-over-year)
+
+```{r}
+# local level trend (filtered, seasonally adjusted) converted to year-over-year
+ll <- readRDS(here("data", "state_space", "local_level_sa_results.rds")) |>
+  transmute(date, trend = 100 * (exp(zoo::rollmeanr(filtered, 12, fill = NA) / 100) - 1))
+
+# headline year-over-year from the NSO index (covers the full sample)
+hl <- readRDS(here("data", "state_space", "headline_pi_2023base.rds")) |>
+  arrange(date) |>
+  transmute(date, headline = 100 * (index / lag(index, 12) - 1))
+
+fig4 <- excl |>
+  select(date, official_core = core_yoy, ex_food = ex_food_yoy) |>
+  left_join(hl, by = "date") |>
+  left_join(ll, by = "date") |>
+  filter(date >= ymd("2012-01-01"))
+saveRDS(fig4, here("data", "exclusion", "fig4_comparison.rds"))
+
+p_fig4 <- fig4 |>
+  pivot_longer(-date) |>
+  mutate(name = factor(name,
+           levels = c("headline", "official_core", "ex_food", "trend"),
+           labels = c("Headline", "Official core (Bank of Mongolia)",
+                      "Ex-food", "Local level trend"))) |>
+  ggplot(aes(date, value, colour = name, linetype = name)) +
+  geom_line(linewidth = 0.6, na.rm = TRUE) +
+  scale_colour_manual(values = c("grey70", "black", "#1f4e79", "#c0504d")) +
+  scale_linetype_manual(values = c("solid", "solid", "solid", "dashed")) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(x = NULL, y = "Year-over-year inflation (%)", colour = NULL, linetype = NULL,
+       caption = "Source: National Statistics Office of Mongolia; Bank of Mongolia; author's calculations.") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.caption = element_text(hjust = 0, colour = "grey30", size = 9),
+        axis.text = element_text(colour = "black"))
+p_fig4
+ggsave(here("output", "exclusion_figures", "fig4_core_measures.png"), p_fig4, width = 6.5, height = 4, dpi = 300)
+ggsave(here("output", "exclusion_figures", "fig4_core_measures.pdf"), p_fig4, width = 6.5, height = 4)
+
+# numbers for the text
+fig4 |>
+  summarise(across(c(headline, ex_food, trend),
+                   list(mean = ~ mean(.x, na.rm = TRUE),
+                        sd   = ~ sd(.x, na.rm = TRUE),
+                        smooth = ~ mean(abs(diff(.x)), na.rm = TRUE)))) |>
+  pivot_longer(everything()) |> mutate(value = round(value, 2)) |> print(n = Inf)
+
+round(cor(fig4[, c("headline", "ex_food", "trend")], use = "complete.obs"), 2)
+
+fig4 |>
+  filter(date %in% ymd(c("2016-06-01", "2022-06-01", "2022-12-01",
+                         "2024-06-01", "2026-02-01", "2026-08-01"))) |>
+  mutate(across(-date, ~ round(.x, 1))) |>
+  print(width = Inf)
+```

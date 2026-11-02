@@ -1,0 +1,383 @@
+---
+title: 'Taylor rule: does the choice of core measure matter for policy?'
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+library(here)
+
+dir.create(here("data", "evaluation", "taylor"), showWarnings = FALSE)
+phi <- 1.5      # Taylor (1993): the policy rate moves 1.5 points for each point of inflation
+```
+
+## Step 1: Policy disagreement implied by the different measures
+
+```{r}
+all_q <- readRDS(here("data", "evaluation", "all_measures_quarterly_yoy.rds"))
+
+labels <- c(ex_food = "Ex-food", trend = "Local level trend", ucsv = "UC-SV",
+            fat_tails = "Fat-tailed trend", dfm = "Dynamic factor", svar_core_yoy = "SVAR core")
+core_cols <- names(labels)
+
+tr <- all_q |>
+  filter(if_all(all_of(c("headline", core_cols)), \(x) !is.na(x))) |>
+  rowwise() |>
+  mutate(high   = max(c_across(all_of(core_cols))),
+         low    = min(c_across(all_of(core_cols))),
+         spread = phi * (high - low)) |>                 # gap between highest and lowest implied rate
+  ungroup()
+range(tr$date); nrow(tr)
+saveRDS(tr, here("data", "evaluation", "taylor", "policy_spread.rds"))
+
+# how large is the disagreement?
+tr |> summarise(mean_spread   = mean(spread),
+                median_spread = median(spread),
+                max_spread    = max(spread),
+                max_date      = date[which.max(spread)],
+                share_over_2  = mean(spread > 2),
+                share_over_4  = mean(spread > 4)) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+# each measure vs. a headline-based rule (policy-rate difference, percentage points)
+tr |>
+  pivot_longer(all_of(core_cols), names_to = "measure", values_to = "infl") |>
+  mutate(diff = phi * (infl - headline)) |>
+  group_by(measure = labels[measure]) |>
+  summarise(mean_diff     = mean(diff),
+            mean_abs_diff = mean(abs(diff)),
+            max_abs_diff  = max(abs(diff)),
+            max_date      = date[which.max(abs(diff))], .groups = "drop") |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  arrange(desc(mean_abs_diff)) |>
+  as.data.frame()
+
+p_spread <- tr |>
+  ggplot(aes(date)) +
+  geom_ribbon(aes(ymin = phi * (low - headline), ymax = phi * (high - headline)), fill = "grey80") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(x = NULL,
+       y = "Implied policy rate relative to\nheadline-based rule (pp)",
+       caption = "Shaded band: range of Taylor-rule rates implied by the six core measures, relative to the rate implied by headline inflation.") +
+  theme_classic(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, colour = "grey30"))
+p_spread
+ggsave(here("output", "evaluation_figures", "taylor_policy_spread.png"), p_spread, width = 9, height = 5, dpi = 300)
+```
+
+## Step 2: Quarterly average policy rate
+
+```{r}
+library(readxl)
+
+pr <- read_excel(here("data", "raw", "bom_policy_rate_2026-10-06.xlsx")) |>
+  transmute(date = as_date(with_tz(`Effective from`, "Asia/Ulaanbaatar")),   # stored in UTC; convert to local date
+            rate = `Policy Rate`) |>
+  arrange(date)
+head(pr, 3)
+
+# daily step function: each rate applies until the next decision, then average over each quarter
+policy_q <- tibble(date = seq(min(pr$date), ymd("2026-09-30"), by = "day")) |>
+  left_join(pr, by = "date") |>
+  fill(rate) |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(policy_rate = mean(rate), .groups = "drop") |>
+  filter(date >= ymd("2017-01-01"))                       # drop the partial first quarter (late Dec 2016)
+range(policy_q$date); nrow(policy_q)
+saveRDS(policy_q, here("data", "evaluation", "taylor", "policy_rate_quarterly.rds"))
+
+ggplot(policy_q, aes(date, policy_rate)) +
+  geom_step() +
+  labs(x = NULL, y = "Policy rate, quarterly average (%)") +
+  theme_classic(base_size = 11)
+```
+
+## Step 3: Taylor-rule rates under each measure vs. the actual policy rate
+
+```{r}
+# Bank of Mongolia inflation target by year (Inflation Reports and Monetary Policy Guidelines)
+target_hist <- tibble(year = 2017:2026, pi_star = c(8, 8, 8, 8, 6, 6, 6, 6, 6, 6))
+
+# output gap: Hodrick-Prescott filter (lambda = 1600) on log seasonally adjusted real GDP
+hp_trend <- function(y, lambda = 1600) {
+  n <- length(y); D <- diff(diag(n), differences = 2)
+  as.numeric(solve(diag(n) + lambda * crossprod(D), y))
+}
+gap <- readRDS(here("data", "svar", "gdp_sa.rds")) |>
+  transmute(date, ly = 100 * log(gdp_sa)) |>
+  mutate(gap = ly - hp_trend(ly)) |>
+  select(date, gap)
+
+all_labels <- c(headline = "Headline", official_core = "Official core", labels)
+
+rule <- all_q |>
+  left_join(gap, by = "date") |>
+  inner_join(policy_q, by = "date") |>
+  mutate(year = year(date)) |>
+  left_join(target_hist, by = "year") |>
+  pivot_longer(all_of(names(all_labels)), names_to = "measure", values_to = "infl") |>
+  filter(!is.na(infl)) |>
+  mutate(measure  = factor(all_labels[measure], levels = all_labels),
+         rule_ex  = infl + 0.5 * (infl - pi_star) + 0.5 * gap)       # Taylor rule, excluding the neutral rate
+
+# calibrate the neutral real rate: headline-based rule matches the actual policy rate on average
+r_star <- rule |> filter(measure == "Headline") |> summarise(r = mean(policy_rate - rule_ex)) |> pull(r)
+round(r_star, 2)
+
+rule <- rule |> mutate(implied = r_star + rule_ex)
+saveRDS(rule, here("data", "evaluation", "taylor", "taylor_implied_rates.rds"))
+
+rule |>
+  group_by(measure) |>
+  summarise(n          = n(),
+            mean_gap   = mean(implied - policy_rate),        # positive: rule tighter than the Bank
+            mean_abs   = mean(abs(implied - policy_rate)),
+            max_abs    = max(abs(implied - policy_rate)),
+            corr       = cor(implied, policy_rate), .groups = "drop") |>
+  mutate(across(where(is.numeric) & !n, \(x) round(x, 2))) |>
+  arrange(mean_abs) |>
+  as.data.frame()
+
+p_rule <- rule |>
+  filter(measure != "Official core") |>
+  ggplot(aes(date)) +
+  geom_step(aes(y = policy_rate), colour = "black") +
+  geom_line(aes(y = implied), colour = "#1f4e79") +
+  facet_wrap(~ measure, ncol = 2) +
+  labs(x = NULL, y = "Policy rate (%)",
+       caption = "Black: Bank of Mongolia policy rate (quarterly average). Blue: Taylor-rule rate implied by each measure.") +
+  theme_classic(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, colour = "grey30"))
+p_rule
+ggsave(here("output", "evaluation_figures", "taylor_implied_vs_actual.png"), p_rule, width = 8, height = 8, dpi = 300)
+```
+
+## Step 4: Which measure best explains the Bank's decisions? (smoothed reaction function)
+
+```{r}
+rf_data <- all_q |>
+  left_join(gap, by = "date") |>
+  inner_join(policy_q |> mutate(lag_rate = lag(policy_rate)), by = "date") |>
+  filter(!is.na(lag_rate))
+range(rf_data$date); nrow(rf_data)
+
+rf_labels <- c(headline = "Headline", labels)
+
+# 1. each measure separately: i_t = c + rho * i_{t-1} + b * pi_t + g * gap_t
+rf <- imap_dfr(rf_labels, \(lab, col) {
+  d   <- rf_data |> transmute(policy_rate, lag_rate, gap, infl = .data[[col]]) |> drop_na()
+  fit <- lm(policy_rate ~ lag_rate + infl + gap, data = d)
+  cf  <- coef(fit); rho <- cf[["lag_rate"]]
+  tibble(measure    = lab, n = nrow(d),
+         rho        = rho,
+         beta_long  = cf[["infl"]] / (1 - rho),      # long-run response to inflation
+         gamma_long = cf[["gap"]]  / (1 - rho),      # long-run response to the output gap
+         p_infl     = summary(fit)$coefficients["infl", 4],
+         r2         = summary(fit)$r.squared,
+         rmse       = sigma(fit),
+         aic        = AIC(fit))
+})
+
+# baseline: smoothing only
+base <- lm(policy_rate ~ lag_rate, data = rf_data)
+rf <- bind_rows(rf, tibble(measure = "None (smoothing only)", n = nobs(base),
+                           rho = coef(base)[["lag_rate"]],
+                           r2 = summary(base)$r.squared, rmse = sigma(base), aic = AIC(base))) |>
+  mutate(across(where(is.numeric) & !n, \(x) round(x, 3))) |>
+  arrange(aic)
+saveRDS(rf, here("data", "evaluation", "taylor", "reaction_functions.rds"))
+rf |> as.data.frame()
+
+# 2. encompassing: headline and each core measure in the same regression
+enc <- map_dfr(names(labels), \(col) {
+  d <- rf_data |> transmute(policy_rate, lag_rate, gap, headline, core = .data[[col]]) |> drop_na()
+  s <- summary(lm(policy_rate ~ lag_rate + headline + core + gap, data = d))$coefficients
+  tibble(measure    = labels[[col]],
+         b_headline = s["headline", 1], p_headline = s["headline", 4],
+         b_core     = s["core", 1],     p_core     = s["core", 4])
+}) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+saveRDS(enc, here("data", "evaluation", "taylor", "reaction_encompassing.rds"))
+enc |> as.data.frame()
+```
+
+## Step 5: Reaction functions with a real-time output gap
+
+```{r}
+# one-sided HP filter: for each quarter, filter only the data available up to that quarter
+hp_onesided <- function(y, lambda = 1600, min_n = 20) {
+  map_dbl(seq_along(y), \(t) if (t < min_n) NA_real_ else {
+    tr <- hp_trend(y[1:t], lambda)
+    y[t] - tr[t]
+  })
+}
+
+gap_rt <- readRDS(here("data", "svar", "gdp_sa.rds")) |>
+  transmute(date, ly = 100 * log(gdp_sa)) |>
+  mutate(gap_rt = hp_onesided(ly)) |>
+  select(date, gap_rt)
+
+# how different are the two-sided and real-time gaps?
+gap |> inner_join(gap_rt, by = "date") |> filter(date >= ymd("2017-01-01")) |>
+  summarise(cor = cor(gap, gap_rt), mean_abs_diff = mean(abs(gap - gap_rt))) |> round(2)
+
+rf_data <- rf_data |> left_join(gap_rt, by = "date")
+
+# fit the reaction function for every measure, with a chosen gap (and optionally extra regressors)
+rf_fit <- function(data, gap_col, extra = NULL, label) {
+  imap_dfr(rf_labels, \(lab, col) {
+    d   <- data |> transmute(policy_rate, lag_rate, g = .data[[gap_col]], infl = .data[[col]],
+                             across(all_of(extra))) |> drop_na()
+    fit <- lm(reformulate(c("lag_rate", "infl", "g", extra), "policy_rate"), data = d)
+    cf  <- coef(fit); rho <- cf[["lag_rate"]]
+    tibble(spec = label, measure = lab, n = nrow(d), rho = rho,
+           beta_long = cf[["infl"]] / (1 - rho),
+           p_infl    = summary(fit)$coefficients["infl", 4],
+           aic       = AIC(fit))
+  })
+}
+
+rf_compare <- bind_rows(rf_fit(rf_data, "gap",    label = "Two-sided gap (baseline)"),
+                        rf_fit(rf_data, "gap_rt", label = "Real-time gap")) |>
+  group_by(spec) |>
+  mutate(rank = rank(aic), d_aic = aic - min(aic)) |>
+  ungroup() |>
+  mutate(across(c(rho, beta_long, p_infl, aic, d_aic), \(x) round(x, 3))) |>
+  arrange(spec, rank)
+rf_compare |> as.data.frame()
+```
+
+## Step 6: Reaction functions with the exchange rate (real-time gap)
+
+```{r}
+fx <- read_excel(here("data", "raw", "bom_mnt_usd_2026-10-06.xlsx")) |>
+  rename(date = 1, rate = 2) |>
+  mutate(date = as_date(with_tz(date, "Asia/Ulaanbaatar")),     # stored in UTC; convert to local date
+         rate = as.numeric(rate)) |>
+  filter(!is.na(rate)) |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(mnt_usd = mean(rate), n = n(), .groups = "drop") |>
+  filter(n >= 85) |>                                              # complete quarters only
+  arrange(date) |>
+  mutate(dep_yoy = 100 * (mnt_usd / lag(mnt_usd, 4) - 1))         # positive = togrog depreciation
+range(fx$date)
+saveRDS(fx, here("data", "evaluation", "taylor", "mnt_usd_quarterly.rds"))
+
+rf_data <- rf_data |> select(-any_of(c("mnt_usd", "dep_yoy"))) |>
+  left_join(select(fx, date, dep_yoy), by = "date")
+stopifnot(!anyNA(rf_data$dep_yoy))
+
+# 1. ranking of measures with the exchange rate added
+rf_fx <- rf_fit(rf_data, "gap_rt", extra = "dep_yoy", label = "Real-time gap + exchange rate") |>
+  mutate(rank = rank(aic), d_aic = aic - min(aic))
+
+# 2. how strongly does the Bank respond to depreciation?
+fx_coef <- imap_dfr(rf_labels, \(lab, col) {
+  d <- rf_data |> transmute(policy_rate, lag_rate, g = gap_rt, infl = .data[[col]], dep_yoy) |> drop_na()
+  s <- summary(lm(policy_rate ~ lag_rate + infl + g + dep_yoy, data = d))$coefficients
+  tibble(measure = lab, b_fx = s["dep_yoy", 1], p_fx = s["dep_yoy", 4],
+         b_fx_long = s["dep_yoy", 1] / (1 - s["lag_rate", 1]))
+})
+
+rf_fx |>
+  left_join(fx_coef, by = "measure") |>
+  mutate(across(c(rho, beta_long, p_infl, aic, d_aic, b_fx, p_fx, b_fx_long), \(x) round(x, 3))) |>
+  arrange(rank) |>
+  as.data.frame()
+
+# 3. encompassing again: headline vs. each core measure, with the real-time gap and the exchange rate
+enc_fx <- map_dfr(names(labels), \(col) {
+  d <- rf_data |> transmute(policy_rate, lag_rate, g = gap_rt, dep_yoy, headline, core = .data[[col]]) |> drop_na()
+  s <- summary(lm(policy_rate ~ lag_rate + headline + core + g + dep_yoy, data = d))$coefficients
+  tibble(measure = labels[[col]], p_headline = s["headline", 4], p_core = s["core", 4])
+}) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+enc_fx |> as.data.frame()
+
+saveRDS(list(ranking = rf_fx, fx = fx_coef, encompassing = enc_fx),
+        here("data", "evaluation", "taylor", "reaction_functions_fx.rds"))
+```
+
+## Step 7: Real-time versions of the policy disagreement and the reaction function
+
+```{r}
+rt_dir <- here("data", "evaluation", "from2012")
+
+# real-time core readings: each quarter's value from that quarter's own vintage
+vint <- list("Local level trend" = readRDS(file.path(rt_dir, "vintages_local_level.rds")),
+             "SVAR core"         = readRDS(file.path(rt_dir, "vintages_svar.rds")),
+             "Dynamic factor"    = readRDS(file.path(rt_dir, "vintages_dfm.rds")))
+rt_core <- imap_dfr(vint, \(v, name) imap_dfr(v, \(vv, o)
+  tibble(date = as.Date(o), measure = name, infl = vv$core[vv$date == as.Date(o)])))
+
+exf <- readRDS(here("data", "exclusion", "exfood_linked_2006.rds")) |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(infl = mean(ex_food_yoy), n = n(), .groups = "drop") |>
+  filter(n == 3) |>
+  transmute(date, measure = "Ex-food", infl)
+
+quasi <- all_q |>
+  select(date, ucsv, fat_tails) |>
+  pivot_longer(-date, names_to = "measure", values_to = "infl") |>
+  mutate(measure = recode(measure, ucsv = "UC-SV", fat_tails = "Fat-tailed trend"))
+
+rt_wide <- bind_rows(rt_core, exf, quasi) |>
+  filter(date %in% unique(rt_core$date)) |>
+  pivot_wider(names_from = measure, values_from = infl) |>
+  inner_join(readRDS(file.path(rt_dir, "target_headline_yoy_q.rds")) |> rename(headline = pi), by = "date") |>
+  drop_na()
+rt_cols <- c("Ex-food", "Local level trend", "UC-SV", "Fat-tailed trend", "Dynamic factor", "SVAR core")
+range(rt_wide$date); nrow(rt_wide)
+
+# 1. policy disagreement: real time vs. full sample, over the same quarters
+rt_tr <- rt_wide |>
+  rowwise() |>
+  mutate(spread = phi * (max(c_across(all_of(rt_cols))) - min(c_across(all_of(rt_cols))))) |>
+  ungroup()
+
+bind_rows(
+  rt_tr |> summarise(version = "Real time", mean = mean(spread), median = median(spread), max = max(spread),
+                     share_over_2 = mean(spread > 2), share_over_4 = mean(spread > 4)),
+  tr |> filter(date %in% rt_tr$date) |>
+    summarise(version = "Full sample", mean = mean(spread), median = median(spread), max = max(spread),
+              share_over_2 = mean(spread > 2), share_over_4 = mean(spread > 4))) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+rt_tr |>
+  pivot_longer(all_of(rt_cols), names_to = "measure", values_to = "infl") |>
+  mutate(diff = phi * (infl - headline)) |>
+  group_by(measure) |>
+  summarise(mean_diff = mean(diff), mean_abs_diff = mean(abs(diff)), max_abs_diff = max(abs(diff)), .groups = "drop") |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  arrange(desc(mean_abs_diff)) |>
+  as.data.frame()
+
+# 2. reaction function with the real-time measures (real-time gap + exchange rate)
+rt_rf_data <- rf_data |>
+  select(date, policy_rate, lag_rate, gap_rt, dep_yoy) |>
+  inner_join(rt_wide, by = "date")
+
+rt_rank <- map_dfr(c("headline", rt_cols), \(col) {
+  d   <- rt_rf_data |> transmute(policy_rate, lag_rate, gap_rt, dep_yoy, infl = .data[[col]]) |> drop_na()
+  fit <- lm(policy_rate ~ lag_rate + infl + gap_rt + dep_yoy, data = d)
+  cf  <- coef(fit)
+  tibble(measure = if (col == "headline") "Headline" else col, n = nrow(d),
+         beta_long = cf[["infl"]] / (1 - cf[["lag_rate"]]),
+         p_infl = summary(fit)$coefficients["infl", 4], aic = AIC(fit))
+}) |>
+  mutate(rank = rank(aic), d_aic = aic - min(aic),
+         across(c(beta_long, p_infl, aic, d_aic), \(x) round(x, 3))) |>
+  arrange(rank)
+rt_rank |> as.data.frame()
+
+saveRDS(list(spread = rt_tr, ranking = rt_rank), here("data", "evaluation", "taylor", "realtime_taylor.rds"))
+```

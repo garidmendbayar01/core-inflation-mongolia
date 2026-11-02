@@ -1,0 +1,87 @@
+---
+title: "Comparing all core inflation measures (quarterly)"
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+library(here)
+
+dir.create(here("data", "evaluation"), showWarnings = FALSE)
+dir.create(here("output", "evaluation_figures"), showWarnings = FALSE)
+```
+
+## Step 1: Combine all measures at quarterly frequency
+
+```{r}
+to_yoy <- function(x) 100 * (exp(zoo::rollmeanr(x, 12, fill = NA) / 100) - 1)   # annualized monthly -> year-over-year
+
+ucsv_rt <- readRDS(here("data", "state_space", "ucsv_realtime.rds")) |>
+  arrange(date) |> transmute(date, ucsv = to_yoy(tau_med))
+ft_rt   <- readRDS(here("data", "state_space", "fat_tails_realtime.rds")) |>
+  arrange(date) |> transmute(date, fat_tails = to_yoy(tau_med))
+dfm     <- readRDS(here("data", "dfm", "dfm_core.rds")) |>
+  arrange(date) |> transmute(date, dfm = dfm_yoy)
+
+more_m <- ucsv_rt |> full_join(ft_rt, by = "date") |> full_join(dfm, by = "date") |> arrange(date)
+more_m |> summarise(across(-date, \(x) sum(!is.na(x))))      # months available per measure
+
+more_q <- more_m |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(across(everything(), mean), n = n(), .groups = "drop") |>
+  filter(n == 3) |>
+  select(-n)
+
+all_q <- readRDS(here("data", "svar", "compare_quarterly_yoy.rds")) |>
+  left_join(more_q, by = "date")
+saveRDS(all_q, here("data", "evaluation", "all_measures_quarterly_yoy.rds"))
+```
+
+## Step 2: Summary statistics on the common sample
+
+```{r}
+measures <- c("ex_food", "trend", "ucsv", "fat_tails", "dfm", "svar_core_yoy")
+
+common <- all_q |> filter(if_all(all_of(c("headline", measures)), \(x) !is.na(x)))
+range(common$date); nrow(common)
+
+common |>
+  summarise(across(all_of(c("headline", measures)),
+                   list(mean   = mean,
+                        sd     = sd,
+                        smooth = \(x) mean(abs(diff(x))),
+                        cor_hl = \(x) cor(x, headline)))) |>
+  pivot_longer(everything(), names_to = c("measure", "stat"),
+               names_pattern = "(.*)_(mean|sd|smooth|cor_hl)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(across(-measure, \(x) round(x, 2)))
+```
+
+## Step 3: Each measure against headline
+
+```{r}
+labels <- c(ex_food = "Ex-food", trend = "Local level trend", ucsv = "UC-SV",
+            fat_tails = "Fat-tailed trend", dfm = "Dynamic factor", svar_core_yoy = "SVAR core")
+
+p_all <- all_q |>
+  pivot_longer(all_of(measures), names_to = "measure", values_to = "value") |>
+  mutate(measure = factor(labels[measure], levels = labels)) |>
+  ggplot(aes(date)) +
+  geom_line(aes(y = headline), colour = "grey70") +
+  geom_line(aes(y = value), colour = "#1f4e79", na.rm = TRUE) +
+  facet_wrap(~ measure, ncol = 2) +
+  labs(x = NULL, y = "Year-over-year inflation (%, quarterly average)",
+       caption = "Grey: headline inflation. Blue: core measure.") +
+  theme_classic(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, colour = "grey30"))
+p_all
+ggsave(here("output", "evaluation_figures", "all_measures_vs_headline.png"), p_all,
+       width = 8, height = 8, dpi = 300)
+```

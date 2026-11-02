@@ -1,0 +1,85 @@
+---
+title: "Extending division indices and the ex-food measure back to 2006"
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+library(here)
+```
+
+## Step 1: Link each division (2015 base before 2010, 2023 base from 2010)
+
+```{r}
+cpi_long <- readRDS(here("data", "svar", "cpi_divisions_all_bases.rds"))
+
+div_codes <- c("Хүнсний бараа, ундаа, ус"                     = "food",
+               "Согтууруулах ундаа, тамхи"                    = "alcohol_tobacco",
+               "Хувцас, бөс бараа, гутал"                     = "clothing",
+               "Орон сууц, ус, цахилгаан, түлш"               = "housing_utilities",
+               "Гэр ахуйн тавилга, гэр ахуйн бараа"           = "furnishings",
+               "Эм тариа, эмнэлгийн үйлчилгээ"                = "health",
+               "Тээвэр"                                       = "transport",
+               "Холбооны хэрэгсэл, шуудангийн үйлчилгээ"      = "communication",
+               "Амралт, чөлөөт цаг, соёлын бараа, үйлчилгээ"  = "recreation",
+               "Боловсролын үйлчилгээ"                        = "education",
+               "Зочид буудал, зоогийн газар, дотуур байр"     = "restaurants_hotels",
+               "Даатгал, санхүүгийн үйлчилгээ"                = "insurance_finance",
+               "Бусад бараа, үйлчилгээ"                       = "other")
+
+divs <- cpi_long |>
+  filter(base %in% c("2015", "2023"), division != "Ерөнхий индекс") |>
+  mutate(code = unname(div_codes[division]),
+         # in the 2015 base, "other goods and services" is mislabeled as insurance in the NSO export
+         code = if_else(base == "2015" & code == "insurance_finance", "other", code)) |>
+  filter(!is.na(code)) |>
+  select(date, base, code, index) |>
+  pivot_wider(names_from = base, values_from = index, names_prefix = "b")
+
+links <- divs |>
+  filter(year(date) == 2010) |>
+  group_by(code) |>
+  summarise(link = sum(b2023) / sum(b2015), .groups = "drop")
+
+div_linked <- divs |>
+  left_join(links, by = "code") |>
+  mutate(index = if_else(!is.na(b2023), b2023, b2015 * link)) |>
+  filter(!is.na(index)) |>
+  select(date, code, index)
+
+div_linked |> group_by(code) |> summarise(first = min(date), last = max(date), n = n())
+saveRDS(div_linked, here("data", "exclusion", "division_indices_linked_2006.rds"))
+```
+
+## Step 2: Ex-food back to 2006, using the official 2023 weights
+
+```{r}
+w_off <- c(food = 26.662467, alcohol_tobacco = 1.016744, clothing = 12.857192,
+           housing_utilities = 9.511357, furnishings = 4.828691, health = 7.32321,
+           transport = 16.71729, communication = 5.807952, recreation = 1.539559,
+           education = 5.28623, restaurants_hotels = 2.409491, other = 5.605346) / 100
+
+exfood_2006 <- div_linked |>
+  filter(code %in% setdiff(names(w_off), "food")) |>
+  mutate(wt = w_off[code]) |>
+  group_by(date) |>
+  summarise(index = sum(wt * index) / sum(wt), n = n(), .groups = "drop") |>
+  arrange(date) |>
+  mutate(ex_food_yoy = 100 * (index / lag(index, 12) - 1))
+table(exfood_2006$n)                                   # should be 11 every month
+
+# check: from 2011 it should match the existing ex-food measure
+readRDS(here("data", "exclusion", "exclusion_measures.rds")) |>
+  select(date, old = ex_food_yoy) |>
+  inner_join(select(exfood_2006, date, new = ex_food_yoy), by = "date") |>
+  filter(!is.na(old)) |>
+  summarise(max_gap = max(abs(old - new)))
+
+saveRDS(exfood_2006, here("data", "exclusion", "exfood_linked_2006.rds"))
+```

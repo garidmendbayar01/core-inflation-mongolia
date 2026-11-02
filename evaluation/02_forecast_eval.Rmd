@@ -1,0 +1,465 @@
+---
+title: "Forecast evaluation"
+author: "Garid Mendbayar"
+date: "2026-10-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+library(tidyverse)
+library(here)
+
+eval_start <- ymd("2017-01-01")   # first forecast origin
+horizons   <- c(4, 8)             # quarters ahead
+```
+
+## Step 1: Target, headline inflation (year-over-year, quarterly)
+
+```{r}
+target <- readRDS(here("data", "svar", "cpi_q_sa.rds")) |>
+  arrange(date) |>
+  transmute(date, pi = 100 * (cpi / lag(cpi, 4) - 1)) |>
+  filter(!is.na(pi))
+range(target$date); nrow(target)
+saveRDS(target, here("data", "evaluation", "target_headline_yoy_q.rds"))
+```
+
+## Step 2: Forecasting engine (direct, recursive)
+
+```{r}
+# forecast pi(t+h) from predictors at t, re-estimated at each origin using only past data
+direct_fc <- function(df, h, predictors, origins, offset_pi = FALSE) {
+  df  <- df |> arrange(date) |> mutate(y_lead = lead(pi, h))
+  rhs <- if (offset_pi) c(predictors, "offset(pi)") else predictors     # offset: coefficient on pi fixed at 1
+  map_dfr(origins, \(o) {
+    train <- df |>
+      filter(date <= o %m-% months(3 * h),
+             if_all(all_of(c("y_lead", "pi", predictors)), \(x) !is.na(x)))
+    fit <- lm(reformulate(rhs, "y_lead"), data = train)
+    tibble(origin = o, h = h, target_date = o %m+% months(3 * h),
+           forecast = as.numeric(predict(fit, filter(df, date == o))))
+  })
+}
+
+fc_data   <- target |> mutate(pi_lag1 = lag(pi))
+origins_h <- function(h) fc_data$date[fc_data$date >= eval_start &
+                                      fc_data$date %m+% months(3 * h) <= max(fc_data$date)]
+```
+
+## Step 3: Benchmark forecasts
+
+```{r}
+bench <- map_dfr(horizons, \(h) {
+  o <- origins_h(h)
+  bind_rows(
+    fc_data |> filter(date %in% o) |>
+      transmute(origin = date, h = h, target_date = date %m+% months(3 * h),
+                forecast = pi, model = "Random walk"),
+    direct_fc(fc_data, h, c("pi", "pi_lag1"), o) |> mutate(model = "AR(2)"),
+    map_dfr(o, \(x) tibble(origin = x, h = h, target_date = x %m+% months(3 * h),
+                           forecast = mean(fc_data$pi[fc_data$date <= x]))) |>
+      mutate(model = "Historical mean")
+  )
+}) |>
+  left_join(select(target, target_date = date, actual = pi), by = "target_date")
+saveRDS(bench, here("data", "evaluation", "forecasts_benchmarks.rds"))
+
+acc <- bench |>
+  group_by(model, h) |>
+  summarise(n    = n(),
+            rmse = sqrt(mean((actual - forecast)^2)),
+            mae  = mean(abs(actual - forecast)),
+            bias = mean(actual - forecast), .groups = "drop") |>
+  group_by(h) |>
+  mutate(rel_rmse = rmse / rmse[model == "Random walk"]) |>
+  ungroup() |>
+  mutate(across(c(rmse, mae, bias, rel_rmse), \(x) round(x, 2)))
+acc
+
+p_bench <- bench |>
+  ggplot(aes(target_date)) +
+  geom_line(aes(y = actual), colour = "grey40", linewidth = 0.8) +
+  geom_line(aes(y = forecast, colour = model)) +
+  facet_wrap(~ paste(h, "quarters ahead"), ncol = 1) +
+  labs(x = NULL, y = "Headline inflation, year-over-year (%)", colour = NULL) +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+p_bench
+ggsave(here("output", "evaluation_figures", "benchmark_forecasts.png"), p_bench, width = 9, height = 7, dpi = 300)
+```
+
+## Step 4: Core measures, starting with ex-food
+
+```{r}
+# forecasts from one core measure: (1) core level as the forecast, (2) gap regression
+core_fc <- function(core_q, name) {
+  d <- fc_data |> left_join(core_q, by = "date") |> mutate(gap = core - pi)
+  map_dfr(horizons, \(h) {
+    o <- origins_h(h)
+    bind_rows(
+      d |> filter(date %in% o) |>
+        transmute(origin = date, h = h, target_date = date %m+% months(3 * h),
+                  forecast = core, model = paste(name, "(level)")),
+      direct_fc(d, h, "gap", o, offset_pi = TRUE) |> mutate(model = paste(name, "(gap)"))
+    )
+  }) |>
+    left_join(select(target, target_date = date, actual = pi), by = "target_date")
+}
+
+accuracy_tbl <- function(fc) {
+  fc |>
+    group_by(model, h) |>
+    summarise(n    = n(),
+              rmse = sqrt(mean((actual - forecast)^2)),
+              mae  = mean(abs(actual - forecast)),
+              bias = mean(actual - forecast), .groups = "drop") |>
+    group_by(h) |>
+    mutate(rel_rmse = rmse / rmse[model == "Random walk"]) |>
+    ungroup() |>
+    mutate(across(c(rmse, mae, bias, rel_rmse), \(x) round(x, 2))) |>
+    arrange(h, rmse)
+}
+
+exfood_q <- readRDS(here("data", "exclusion", "exclusion_measures.rds")) |>
+  mutate(date = floor_date(date, "quarter")) |>
+  group_by(date) |>
+  summarise(core = mean(ex_food_yoy), n = n(), .groups = "drop") |>
+  filter(n == 3, !is.na(core)) |>
+  select(-n)
+range(exfood_q$date)
+
+fc_exfood <- core_fc(exfood_q, "Ex-food")
+saveRDS(fc_exfood, here("data", "evaluation", "forecasts_exfood.rds"))
+
+accuracy_tbl(bind_rows(bench, fc_exfood))
+```
+
+## Step 5: Local level trend in real time (recursive X-13 and model re-estimation)
+
+```{r}
+library(seasonal)
+cpi_m <- readRDS(here("data", "svar", "cpi_linked_monthly.rds")) |> arrange(date)
+
+# one vintage: everything re-estimated using CPI up to the end of origin quarter o
+ll_vintage <- function(o) {
+  d   <- cpi_m |> filter(date <= o %m+% months(2))
+  x   <- ts(d$cpi, start = c(year(d$date[1]), month(d$date[1])), frequency = 12)
+  sa  <- seas(x, regression.aictest = NULL, transform.function = "log")
+  pi_sa <- 1200 * diff(log(as.numeric(final(sa))))
+  fit <- StructTS(pi_sa, type = "level")
+  tibble(date = d$date[-1], tau = as.numeric(fitted(fit)[, "level"])) |>
+    mutate(core_yoy = 100 * (exp(zoo::rollmeanr(tau, 12, fill = NA) / 100) - 1),
+           date     = floor_date(date, "quarter")) |>
+    group_by(date) |>
+    summarise(core = mean(core_yoy), n = n(), .groups = "drop") |>
+    filter(n == 3, !is.na(core)) |>
+    select(-n)
+}
+
+all_origins <- origins_h(min(horizons))
+ll_rt <- map(all_origins, \(o) tryCatch(ll_vintage(o), error = \(e) NULL)) |>
+  set_names(as.character(all_origins))
+sum(map_lgl(ll_rt, is.null))                        # number of failed vintages (should be 0)
+saveRDS(ll_rt, here("data", "evaluation", "vintages_local_level.rds"))
+
+# forecasts from real-time vintages: each origin uses its own vintage of the core history
+core_fc_rt <- function(vintages, name) {
+  map_dfr(horizons, \(h) map_dfr(origins_h(h), \(o) {
+    d <- fc_data |>
+      filter(date <= o) |>
+      left_join(vintages[[as.character(o)]], by = "date") |>
+      mutate(gap = core - pi, y_lead = lead(pi, h))
+    tr      <- d |> filter(date <= o %m-% months(3 * h), !is.na(y_lead), !is.na(gap))
+    now     <- filter(d, date == o)
+    fit_gap <- lm(y_lead ~ gap + offset(pi), data = tr)     # gap regression (Cogley, 2002)
+    fit_reg <- lm(y_lead ~ core, data = tr)                 # core regression: nests the historical mean
+    tibble(origin = o, h = h, target_date = o %m+% months(3 * h),
+           model    = paste(name, c("(level)", "(gap)", "(regression)")),
+           forecast = as.numeric(c(now$core, predict(fit_gap, now), predict(fit_reg, now))))
+  })) |>
+    left_join(select(target, target_date = date, actual = pi), by = "target_date")
+}
+
+fc_ll <- core_fc_rt(ll_rt, "Local level")
+saveRDS(fc_ll, here("data", "evaluation", "forecasts_local_level.rds"))
+
+accuracy_tbl(bind_rows(bench, fc_exfood, fc_ll))
+```
+
+## Step 6: All three forecast forms for ex-food and the local level trend
+
+```{r}
+exfood_vintages <- set_names(rep(list(exfood_q), length(all_origins)), as.character(all_origins))
+
+fc_exfood <- core_fc_rt(exfood_vintages, "Ex-food")
+fc_ll     <- core_fc_rt(ll_rt, "Local level")
+saveRDS(fc_exfood, here("data", "evaluation", "forecasts_exfood.rds"))
+saveRDS(fc_ll,     here("data", "evaluation", "forecasts_local_level.rds"))
+
+accuracy_tbl(bind_rows(bench, fc_exfood, fc_ll)) |> as.data.frame()
+```
+
+## Step 7: SVAR core in real time
+
+```{r}
+gdp_lin <- readRDS(here("data", "svar", "gdp_linked_nsa.rds"))
+cpi_qr  <- readRDS(here("data", "svar", "cpi_q_sa.rds")) |> select(date, cpi)
+
+svar_vintage <- function(o) {
+  g    <- gdp_lin |> filter(date <= o)
+  cp   <- cpi_qr  |> filter(date <= o)
+  g_sa <- final(seas(ts(g$gdp, start = c(2000, 1), frequency = 4)))
+  c_sa <- final(seas(ts(cp$cpi, start = c(2006, 1), frequency = 4),
+                     regression.aictest = NULL, transform.function = "log"))
+  dat <- tibble(date = g$date,  growth = 400 * c(NA, diff(log(as.numeric(g_sa))))) |>
+    inner_join(tibble(date = cp$date, infl = 400 * c(NA, diff(log(as.numeric(c_sa))))), by = "date") |>
+    filter(!is.na(growth), !is.na(infl))
+
+  vf  <- vars::VAR(as.matrix(dat[, c("growth", "infl")]), p = 1, type = "const")
+  bq  <- vars::BQ(vf)
+  B   <- bq$B %*% diag(c(sign(bq$LRIM[1, 1]), sign(bq$B[2, 2])))
+  A1  <- vars::Acoef(vf)[[1]]
+  mu  <- solve(diag(2) - A1, sapply(vf$varresult, \(m) coef(m)[["const"]]))
+  eps <- resid(vf) %*% t(solve(B))
+
+  contrib <- matrix(0, nrow(eps), 2)
+  for (t in seq_len(nrow(eps))) {
+    contrib[t, ] <- A1 %*% (if (t == 1) c(0, 0) else contrib[t - 1, ]) + B[, 2] * eps[t, 2]
+  }
+  tibble(date = dat$date[-1], core_q = mu[2] + contrib[, 2]) |>
+    mutate(p_core = cumsum(core_q / 400),
+           core   = 100 * (exp(p_core - lag(p_core, 4)) - 1)) |>
+    filter(!is.na(core)) |>
+    select(date, core)
+}
+
+svar_rt <- map(all_origins, \(o) tryCatch(svar_vintage(o), error = \(e) NULL)) |>
+  set_names(as.character(all_origins))
+sum(map_lgl(svar_rt, is.null))                      # failed vintages (should be 0)
+saveRDS(svar_rt, here("data", "evaluation", "vintages_svar.rds"))
+
+fc_svar <- core_fc_rt(svar_rt, "SVAR")
+saveRDS(fc_svar, here("data", "evaluation", "forecasts_svar.rds"))
+
+accuracy_tbl(bind_rows(bench, fc_exfood, fc_ll, fc_svar)) |> as.data.frame()
+```
+
+## Step 8: Dynamic factor model in real time
+
+```{r}
+# the 10 divisions used in the DFM (2023 base), plus headline
+dfm_codes <- c("Хүнсний бараа, ундаа, ус"                      = "food",
+               "Согтууруулах ундаа, тамхи"                     = "alcohol_tobacco",
+               "Хувцас, бөс бараа, гутал"                      = "clothing",
+               "Орон сууц, ус, цахилгаан, түлш"                = "housing_utilities",
+               "Гэр ахуйн тавилга, гэр ахуйн бараа"            = "furnishings",
+               "Эм тариа, эмнэлгийн үйлчилгээ"                 = "health",
+               "Тээвэр"                                        = "transport",
+               "Амралт, чөлөөт цаг, соёлын бараа, үйлчилгээ"   = "recreation",
+               "Зочид буудал, зоогийн газар, дотуур байр"      = "restaurants_hotels",
+               "Бусад бараа, үйлчилгээ"                        = "other")
+
+div_m <- readRDS(here("data", "svar", "cpi_divisions_all_bases.rds")) |>
+  filter(base == "2023") |>
+  mutate(code = unname(c(dfm_codes, "Ерөнхий индекс" = "headline")[division])) |>
+  filter(!is.na(code)) |>
+  select(date, code, index)
+
+# seasonally adjusted, annualized monthly inflation from one index (NA if X-13 fails)
+sa_infl <- function(idx, start_date) {
+  x  <- ts(idx, start = c(year(start_date), month(start_date)), frequency = 12)
+  sa <- tryCatch(final(seas(x, regression.aictest = NULL, transform.function = "log")),
+                 error = \(e) NULL)
+  if (is.null(sa)) return(rep(NA_real_, length(idx) - 1))
+  1200 * diff(log(as.numeric(sa)))
+}
+
+# Stock-Watson outlier rule: values more than 6 IQRs from the median -> median of previous 5 months
+clean_outliers <- function(x) {
+  bad <- abs(x - median(x, na.rm = TRUE)) > 6 * IQR(x, na.rm = TRUE)
+  for (i in which(bad)) if (i > 1) x[i] <- median(x[max(1, i - 5):(i - 1)], na.rm = TRUE)
+  x
+}
+
+dfm_vintage <- function(o) {
+  infl <- div_m |>
+    filter(date <= o %m+% months(2)) |>
+    arrange(code, date) |>
+    group_by(code) |>
+    reframe(date = date[-1], pi = sa_infl(index, date[1]))
+  wide <- infl |> pivot_wider(names_from = code, values_from = pi) |> arrange(date)
+
+  X <- wide |> select(all_of(unname(dfm_codes))) |> mutate(across(everything(), clean_outliers))
+  X <- X[, colSums(is.na(X)) == 0]                  # drop any division whose X-13 failed
+  X <- scale(X)
+
+  pc <- prcomp(X, center = FALSE, scale. = FALSE)
+  f  <- pc$x[, 1] * sign(mean(pc$rotation[, 1]))    # sign: factor rises with inflation
+  reg <- tibble(date = wide$date, pi = wide$headline, f = f)
+  fit <- lm(pi ~ f, data = reg)
+
+  reg |>
+    mutate(dfm_m    = fitted(fit),
+           core_yoy = 100 * (exp(zoo::rollmeanr(dfm_m, 12, fill = NA) / 100) - 1),
+           date     = floor_date(date, "quarter")) |>
+    group_by(date) |>
+    summarise(core = mean(core_yoy), n = n(), .groups = "drop") |>
+    filter(n == 3, !is.na(core)) |>
+    select(-n)
+}
+
+dfm_rt <- map(all_origins, \(o) tryCatch(dfm_vintage(o), error = \(e) NULL)) |>
+  set_names(as.character(all_origins))
+sum(map_lgl(dfm_rt, is.null))                       # failed vintages (should be 0)
+saveRDS(dfm_rt, here("data", "evaluation", "vintages_dfm.rds"))
+
+fc_dfm <- core_fc_rt(dfm_rt, "DFM")
+saveRDS(fc_dfm, here("data", "evaluation", "forecasts_dfm.rds"))
+```
+
+## Step 9: UC-SV and fat-tailed trend (quasi-real-time: filtered states, full-sample parameters)
+
+```{r}
+q_from_rt <- function(file) {
+  readRDS(here("data", "state_space", file)) |>
+    arrange(date) |>
+    mutate(core_yoy = 100 * (exp(zoo::rollmeanr(tau_med, 12, fill = NA) / 100) - 1),
+           date     = floor_date(date, "quarter")) |>
+    group_by(date) |>
+    summarise(core = mean(core_yoy), n = n(), .groups = "drop") |>
+    filter(n == 3, !is.na(core)) |>
+    select(-n)
+}
+const_vintages <- function(q) set_names(rep(list(q), length(all_origins)), as.character(all_origins))
+
+fc_ucsv <- core_fc_rt(const_vintages(q_from_rt("ucsv_realtime.rds")),      "UC-SV")
+fc_ft   <- core_fc_rt(const_vintages(q_from_rt("fat_tails_realtime.rds")), "Fat-tailed")
+saveRDS(fc_ucsv, here("data", "evaluation", "forecasts_ucsv.rds"))
+saveRDS(fc_ft,   here("data", "evaluation", "forecasts_fat_tails.rds"))
+
+fc_all <- bind_rows(bench, fc_exfood, fc_ll, fc_svar, fc_dfm, fc_ucsv, fc_ft)
+saveRDS(fc_all, here("data", "evaluation", "forecasts_all.rds"))
+accuracy_tbl(fc_all) |> as.data.frame()
+```
+
+## Step 10: Equal-weighted combination of core measures (regression forms)
+
+```{r}
+fc_comb <- fc_all |>
+  filter(str_detect(model, "\\(regression\\)")) |>
+  group_by(origin, h, target_date, actual) |>
+  summarise(forecast = mean(forecast), .groups = "drop") |>
+  mutate(model = "Equal-weighted combination")
+
+fc_all <- bind_rows(fc_all, fc_comb)
+saveRDS(fc_all, here("data", "evaluation", "forecasts_all.rds"))
+```
+
+## Step 11: Diebold-Mariano and Clark-West tests
+
+```{r}
+# Newey-West (Bartlett) long-run variance
+hac_var <- function(x, lags) {
+  n <- length(x); x <- x - mean(x)
+  v <- sum(x^2) / n
+  for (l in seq_len(lags)) v <- v + 2 * (1 - l / (lags + 1)) * sum(x[(l + 1):n] * x[1:(n - l)]) / n
+  v
+}
+
+# Diebold-Mariano with Harvey-Leybourne-Newbold correction; positive = model beats benchmark
+dm_test <- function(e_bench, e_model, h) {
+  d <- e_bench^2 - e_model^2; n <- length(d)
+  stat <- mean(d) / sqrt(hac_var(d, h - 1) / n) * sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+  c(dm = stat, p_dm = 2 * pt(-abs(stat), df = n - 1))
+}
+
+# Clark-West for nested models; one-sided: does the larger model add information?
+cw_test <- function(e_null, e_alt, f_null, f_alt, h) {
+  adj <- e_null^2 - (e_alt^2 - (f_null - f_alt)^2); n <- length(adj)
+  stat <- mean(adj) / sqrt(hac_var(adj, h - 1) / n)
+  c(cw = stat, p_cw = pnorm(-stat))
+}
+
+errs <- fc_all |> mutate(e = actual - forecast)
+bm   <- errs |> filter(model %in% c("Historical mean", "Random walk")) |>
+  select(origin, h, model, e, forecast) |>
+  pivot_wider(names_from = model, values_from = c(e, forecast))
+
+tests <- errs |>
+  filter(!model %in% c("Historical mean", "Random walk")) |>
+  left_join(bm, by = c("origin", "h")) |>
+  group_by(model, h) |>
+  summarise(
+    rmse  = sqrt(mean(e^2)),
+    rel_mean = rmse / sqrt(mean(`e_Historical mean`^2)),
+    as_tibble_row(dm_test(`e_Historical mean`, e, first(h))) |> rename(dm_vs_mean = dm, p_vs_mean = p_dm),
+    as_tibble_row(dm_test(`e_Random walk`, e, first(h)))     |> rename(dm_vs_rw = dm,   p_vs_rw = p_dm),
+    as_tibble_row(cw_test(`e_Historical mean`, e, `forecast_Historical mean`, forecast, first(h))),
+    .groups = "drop") |>
+  mutate(p_cw = if_else(str_detect(model, "\\(regression\\)"), p_cw, NA_real_),
+         cw   = if_else(str_detect(model, "\\(regression\\)"), cw,   NA_real_)) |>
+  mutate(across(where(is.numeric) & !h, \(x) round(x, 3))) |>
+  arrange(h, rmse)
+saveRDS(tests, here("data", "evaluation", "forecast_tests.rds"))
+
+tests |> filter(str_detect(model, "regression|combination|AR")) |> as.data.frame()
+```
+
+## Step 12: Does core add information beyond current inflation? (2017 evaluation)
+
+```{r}
+# load the saved 2017 vintages instead of re-estimating them
+all_origins     <- origins_h(min(horizons))
+ll_rt           <- readRDS(here("data", "evaluation", "vintages_local_level.rds"))
+svar_rt         <- readRDS(here("data", "evaluation", "vintages_svar.rds"))
+dfm_rt          <- readRDS(here("data", "evaluation", "vintages_dfm.rds"))
+exfood_vintages <- set_names(rep(list(exfood_q), length(all_origins)), as.character(all_origins))
+
+# test functions (same as Step 11)
+hac_var <- function(x, lags) {
+  n <- length(x); x <- x - mean(x)
+  v <- sum(x^2) / n
+  for (l in seq_len(lags)) v <- v + 2 * (1 - l / (lags + 1)) * sum(x[(l + 1):n] * x[1:(n - l)]) / n
+  v
+}
+cw_test <- function(e_null, e_alt, f_null, f_alt, h) {
+  adj <- e_null^2 - (e_alt^2 - (f_null - f_alt)^2); n <- length(adj)
+  stat <- mean(adj) / sqrt(hac_var(adj, h - 1) / n)
+  c(cw = stat, p_cw = pnorm(-stat))
+}
+
+aug_fc <- function(vintages, name) {
+  map_dfr(horizons, \(h) map_dfr(origins_h(h), \(o) {
+    d <- fc_data |>
+      filter(date <= o) |>
+      left_join(vintages[[as.character(o)]], by = "date") |>
+      mutate(y_lead = lead(pi, h))
+    tr  <- d |> filter(date <= o %m-% months(3 * h), !is.na(y_lead), !is.na(core))
+    now <- filter(d, date == o)
+    tibble(origin = o, h = h, target_date = o %m+% months(3 * h), measure = name,
+           f_null = as.numeric(predict(lm(y_lead ~ pi,        data = tr), now)),
+           f_alt  = as.numeric(predict(lm(y_lead ~ pi + core, data = tr), now)))
+  })) |>
+    left_join(select(target, target_date = date, actual = pi), by = "target_date")
+}
+
+aug <- bind_rows(aug_fc(exfood_vintages, "Ex-food"),
+                 aug_fc(ll_rt,           "Local level"),
+                 aug_fc(svar_rt,         "SVAR"),
+                 aug_fc(dfm_rt,          "DFM"))
+saveRDS(aug, here("data", "evaluation", "forecasts_augmented.rds"))
+
+aug |>
+  mutate(e_null = actual - f_null, e_alt = actual - f_alt) |>
+  group_by(measure, h) |>
+  summarise(rmse_infl_only = sqrt(mean(e_null^2)),
+            rmse_infl_core = sqrt(mean(e_alt^2)),
+            as_tibble_row(cw_test(e_null, e_alt, f_null, f_alt, first(h))), .groups = "drop") |>
+  mutate(across(where(is.numeric) & !h, \(x) round(x, 3))) |>
+  arrange(h, p_cw) |>
+  as.data.frame()
+```
